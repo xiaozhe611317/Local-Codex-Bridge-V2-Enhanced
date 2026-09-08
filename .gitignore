@@ -1,0 +1,23 @@
+node_modules/
+dist/
+_codex_tmp/
+_render_tmp/
+_render_cache/
+_render_out/
+_render_home/
+npm-debug.log*
+.env
+.env.*
+windows/local-settings.json
+.DS_Store
+
+# Controlled baseline: excluded-sensitive filename matches.
+# Conservative name matches only; dependency contents were not inspected.
+/node_modules/typescript/dist/enums/tokenFlags.d.ts
+/node_modules/typescript/dist/enums/tokenFlags.d.ts.map
+/node_modules/typescript/dist/enums/tokenFlags.enum.d.ts
+/node_modules/typescript/dist/enums/tokenFlags.enum.d.ts.map
+/node_modules/typescript/dist/enums/tokenFlags.enum.js
+/node_modules/typescript/dist/enums/tokenFlags.enum.js.map
+/node_modules/typescript/dist/enums/tokenFlags.js
+/node_modules/typescript/dist/enums/tokenFlags.js.map

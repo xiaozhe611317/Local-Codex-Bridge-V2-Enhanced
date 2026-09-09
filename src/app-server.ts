@@ -10,6 +10,7 @@ import {
 } from "./runtime.js";
 import { platformPolicyFor, type PlatformPolicy } from "./platform.js";
 import { VERSION } from "./version.js";
+import { observeRecoveryNotification, responseTurn, terminalThreadRead, type LateTurnEvidence } from "./late-turn-recovery.js";
 
 const MAX_JSONL_BYTES = 10 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
@@ -34,6 +35,7 @@ const MUTATING_REQUEST_METHODS = new Set([
 
 interface PendingCall {
   method: string;
+  issuedSequence: number;
   threadId?: string;
   turnId?: string;
   resolve: (value: unknown) => void;
@@ -55,6 +57,7 @@ interface RetainedLateResponse {
   candidate: LateResponseCandidate;
   timedOutAt: string;
   expiresAtMs: number;
+  turnEvidence?: LateTurnEvidence;
 }
 
 export interface AppServerLaunchOptions {
@@ -373,6 +376,7 @@ export class AppServerManager {
   #closing = false;
   #initialized = false;
   #nextRequestId = 1;
+  #evidenceSequence = 0;
   #stdoutBuffer = Buffer.alloc(0);
   #operations = 0;
   #writesInFlight = 0;
@@ -655,7 +659,7 @@ export class AppServerManager {
       const requestScope = asRecord(params);
       const threadId = boundedScopeId(requestScope?.threadId);
       const turnId = boundedScopeId(requestScope?.turnId ?? requestScope?.expectedTurnId);
-      this.#pendingCalls.set(key, { method, resolve, reject, timer,
+      this.#pendingCalls.set(key, { method, resolve, reject, timer, issuedSequence: this.#evidenceSequence,
         ...(threadId ? { threadId } : {}), ...(turnId ? { turnId } : {}) });
       void this.#write({ method, id, params }).catch((error: unknown) => {
         const pending = this.#pendingCalls.get(key);
@@ -693,20 +697,67 @@ export class AppServerManager {
     });
   }
 
-  #takeLateResponse(key: string): RetainedLateResponse | undefined {
-    const retained = this.#lateResponses.get(key);
-    if (!retained) {
-      return undefined;
+  #pruneLateResponses(): void {
+    const now = Date.now();
+    for (const [key, retained] of this.#lateResponses) {
+      if (retained.expiresAtMs <= now) this.#lateResponses.delete(key);
     }
+  }
+
+  #settleLateResponse(key: string): void {
     this.#lateResponses.delete(key);
-    return retained.expiresAtMs > Date.now() ? retained : undefined;
+    this.#uncertainMutationIds.delete(key);
+    this.#uncertainMutation = this.#uncertaintyOverflow || this.#uncertainMutationIds.size > 0;
+  }
+
+  #uniqueTurnEvidence(retained: RetainedLateResponse): boolean {
+    if (retained.candidate.method !== "turn/start" || !retained.turnEvidence) return false;
+    const threadId = retained.candidate.requestedThreadId;
+    return [...this.#lateResponses.values()].filter(other =>
+      other.candidate.method === "turn/start" && other.candidate.requestedThreadId === threadId &&
+      other.turnEvidence?.turnId === retained.turnEvidence!.turnId).length === 1;
+  }
+
+  #recoverFromNotification(method: string, params: unknown): void {
+    for (const [key, retained] of this.#lateResponses) {
+      if (retained.candidate.method !== "turn/start" || !retained.turnEvidence) continue;
+      const threadId = retained.candidate.requestedThreadId;
+      const evidence = retained.turnEvidence;
+      observeRecoveryNotification(evidence, threadId, method, params, this.#evidenceSequence);
+      if (!evidence.terminal || !evidence.idle) continue;
+      if (!this.#uniqueTurnEvidence(retained)) {
+        evidence.terminal = null;
+        evidence.idle = false;
+        continue;
+      }
+      const live = this.runtime.observe(threadId, undefined, 1);
+      if (live && live.active_turn_id === null && ["idle", "completed", "failed", "interrupted"].includes(live.runtime_status)) {
+        this.#settleLateResponse(key);
+      }
+    }
+  }
+
+  #recoverFromThreadRead(pending: PendingCall, result: unknown): void {
+    if (pending.method !== "thread/read" || !pending.threadId) return;
+    for (const [key, retained] of this.#lateResponses) {
+      const evidence = retained.turnEvidence;
+      if (retained.candidate.method !== "turn/start" || retained.candidate.requestedThreadId !== pending.threadId ||
+          !evidence || !this.#uniqueTurnEvidence(retained) ||
+          evidence.boundSequence > pending.issuedSequence || evidence.lastSequence > pending.issuedSequence) continue;
+      if (terminalThreadRead(result, pending.threadId, evidence.turnId) &&
+          this.runtime.confirmRecoveredThreadRead(pending.threadId, evidence.turnId)) {
+        this.#settleLateResponse(key);
+      }
+    }
   }
 
   #reconcileLateResponse(
     retained: RetainedLateResponse,
     response: Record<string, unknown>,
   ): boolean {
+    if (retained.turnEvidence) retained.turnEvidence.lastSequence = this.#evidenceSequence;
     if (response.error !== undefined && response.error !== null) {
+      if (Object.hasOwn(response, "result") || retained.turnEvidence) return false;
       const nativeError = asRecord(response.error);
       if (typeof nativeError?.code !== "number" || typeof nativeError.message !== "string") return false;
       const candidate = retained.candidate;
@@ -757,12 +808,14 @@ export class AppServerManager {
       return true;
     }
 
-    const turn = asRecord(result.turn);
+    const turn = responseTurn(result, candidate.requestedThreadId, retained.turnEvidence?.turnId);
     const turnId = boundedScopeId(turn?.id);
-    if (!turnId) {
-      return false;
-    }
-    const status = turn?.status;
+    if (!turn || !turnId) return false;
+    retained.turnEvidence ??= {
+      turnId, boundSequence: this.#evidenceSequence, lastSequence: this.#evidenceSequence,
+      terminal: null, idle: false,
+    };
+    const status = turn.status;
     // A scoped turn id alone cannot settle a timed-out mutation. Validate the
     // native Turn status before reconciliation can preserve an older idle state.
     // Thread/Bridge states (for example idle) are not supported Turn statuses.
@@ -827,6 +880,8 @@ export class AppServerManager {
   }
 
   #dispatch(message: unknown): void {
+    this.#evidenceSequence += 1;
+    this.#pruneLateResponses();
     const record = asRecord(message);
     if (!record) {
       throw new Error("app-server emitted a non-object message");
@@ -856,6 +911,7 @@ export class AppServerManager {
         }
       } else {
         this.runtime.recordNotification(method, record.params);
+        this.#recoverFromNotification(method, record.params);
       }
       return;
     }
@@ -864,12 +920,11 @@ export class AppServerManager {
     }
     const pending = this.#pendingCalls.get(rpcKey(id));
     if (!pending) {
-      const retained = this.#takeLateResponse(rpcKey(id));
+      const retained = this.#lateResponses.get(rpcKey(id));
       if (retained) {
         const verified = this.#reconcileLateResponse(retained, record);
         if (verified) {
-          this.#uncertainMutationIds.delete(rpcKey(id));
-          this.#uncertainMutation = this.#uncertaintyOverflow || this.#uncertainMutationIds.size > 0;
+          this.#settleLateResponse(rpcKey(id));
         }
       }
       return;
@@ -887,6 +942,7 @@ export class AppServerManager {
         new Error(`Codex app-server ${pending.method} failed: ${redactText(detail)}`),
       );
     } else {
+      this.#recoverFromThreadRead(pending, record.result);
       pending.resolve(record.result);
     }
   }

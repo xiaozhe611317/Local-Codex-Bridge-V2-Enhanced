@@ -552,7 +552,7 @@ MIT License — see [`LICENSE`](LICENSE).
 
 `codex_runtime { "action": "status" }` 不启动子进程。它返回 Bridge 管理的 app-server 的状态、可取得时的 PID、握手状态、live generation、active turn/pending request 数量与 `safe_to_restart`。未启动、已退出或无法取得 PID 时返回 null/unavailable；不扫描其他 Codex 实例，不返回请求内容、环境、登录信息或 Tunnel 设置。
 
-`codex_runtime { "action": "restart" }` 只终止并重新启动当前 Bridge 管理的 app-server 子进程，然后重新执行 initialize/initialized。Bridge 和 Tunnel 都不重启。任何 active turn、pending approval/user-input（包括没有 turn_id 的请求）、正在执行的 RPC/写入/turn 启动事务、关闭或重启操作都会导致 `RESTART_DENIED`。已发送 mutation 超时且原子进程仍存活时，因 outcome UNKNOWN 也拒绝重启；这项保守锁定不会随 late-response retention 到期而自行解除。有效且作用域匹配的迟到原生回执可解除对应 UNKNOWN；没有这种证据时继续保守锁定，进程实际退出后才可显式恢复。
+`codex_runtime { "action": "restart" }` 只终止并重新启动当前 Bridge 管理的 app-server 子进程，然后重新执行 initialize/initialized。Bridge 和 Tunnel 都不重启。任何 active turn、pending approval/user-input（包括没有 turn_id 的请求）、正在执行的 RPC/写入/turn 启动事务、关闭或重启操作都会导致 `RESTART_DENIED`。已发送 mutation 超时且原子进程仍存活时，因 outcome UNKNOWN 也拒绝重启；这项保守锁定不会随 late-response retention 到期而自行解除。在既有 TTL/容量内，无效迟到回执不会消耗关联。后续同请求 ID 的有效回执，或精确匹配的 terminal+idle 通知 / 新鲜 thread/read，可解除对应 UNKNOWN；恢复规则见下方说明。关联失效后不猜测请求与 turn 的关系，实际子进程退出仍是既有独立恢复边界。
 
 异常退出仍然锁定错误，后续普通调用不会自动重启；重启握手失败也不会重试。status 是瞬时快照，restart 会在实际执行时再次检查并同步取得排他门闩。工具 annotation 覆盖两种 action，所以 codex_runtime 整体标记为可能修改/破坏状态；status action 本身只读。
 
@@ -591,7 +591,7 @@ supervision 精确抑制 `item/agentMessage/delta` 和 `thread/tokenUsage/update
 - unresolved：本次新增异常代码/原生 warning/error；
 - next：基于真实状态的 inspect_pending_requests、inspect_local_evidence、observe_remaining_delta 或 re_anchor 提示；不会自行执行这些动作。
 
-auto 的局部扩展触发包括 cursor_lost、mutation outcome UNKNOWN、app-server unexpected exit/unavailable、restart failure、native/MCP JSON-RPC/protocol error、unknown pending request/state、turn/terminal 矛盾，以及非零 command exit 且输出缺失或超过短摘要预算。缺少有效迟到回执的 UNKNOWN 和仍不可用的子进程不会因“提示已读”而被推断为恢复。准确匹配的有效原生回执可解除对应 UNKNOWN；TTL 到期、缺字段或作用域不匹配不能解除。
+auto 的局部扩展触发包括 cursor_lost、mutation outcome UNKNOWN、app-server unexpected exit/unavailable、restart failure、native/MCP JSON-RPC/protocol error、unknown pending request/state、turn/terminal 矛盾，以及非零 command exit 且输出缺失或超过短摘要预算。缺少有效迟到回执的 UNKNOWN 和仍不可用的子进程不会因“提示已读”而被推断为恢复。准确匹配且仍可关联的有效回执、terminal+idle 通知或新鲜 thread/read 可解除对应 UNKNOWN；TTL 到期本身、缺字段或作用域不匹配不能解除。
 
 `diagnostics` 最多附加 6 条相关本线程 recent raw 摘录（序列化正文预算 6000 字符）、4 条 runtime 诊断元数据及 4 条连接错误响应。命令失败只展开相关命令；无从关联线程的协议错误只附加原错误响应，不重放无关线程历史。重复的持续异常不会重复附加旧 raw 内容。原始诊断摘录保留真实 cursor 并标明不推进主事件 cursor。进程/连接诊断 ring 各最多 32 条，全部为本地有界临时证据。
 
@@ -631,3 +631,11 @@ checkpoint 仍是 Goal、硬约束、current state、validation/unresolved 摘�
 Windows 采用原生绝对 drive-letter 路径规范化、大小写不敏感的目录边界比较、stat/realpath 与逐级 link 检查。拒绝原始 .. 分量、UNC/device、ADS、保留设备名、尾随点/空格等歧义路径、缺失/不可读/非目录路径及 symlink/junction（包括 root 自身或祖先）。即使 link 指回允许范围内，也保守拒绝。规范与磁盘真实路径都须匹配范围，并以目录 file identity 核对真实祖先（避免 Windows 可区分大小写目录中的同名路径混淆）；每次选择时重新检查。macOS 比较区分大小写。
 
 **allowed_roots 是 Bridge 选择 cwd 的 targeting policy，不是 OS sandbox、ACL 或多租户隔离。** 它不撤销 native Codex 已有能力，不限制 thread visibility，也不能保证命令内部只访问这些目录。文件系统可在检查后变化；这不是持有文件句柄的强制访问控制。原生 sandbox/approval 与本机用户的权限仍是执行边界。
+
+### UNKNOWN 的有界、精确恢复
+
+无效迟到 turn/start 回执只能通过实际 RPC ID 和请求线程绑定一个格式正确的 turn ID；这只是关联，不是状态已验证。后续同 ID 回执必须匹配该 turn，status 仍限原生支持值。通知恢复要求此关联唯一，并收到同线程/同 turn 的有效 terminal 和支持的 idle；两者先后顺序均可，但 turn/started/active/future 状态不能代替完成证据。恢复后仍独立检查 active、pending 与 in-flight guards。有效同 ID 的 inProgress 回执可证明启动已接受，但仍保持 active、禁止重启。
+
+thread/read 必须在关联建立后发起；读取期间有该线程的新通知或该关联的新回执，便拒绝用较旧读取来恢复。响应必须匹配请求线程、明确 idle、具有非重复且格式正确的终止 turn 列表（检查上限 1000），其中唯一一个 turn 精确匹配该 mutation，且 status 为 completed/failed/interrupted。这条路径只使用调用者发起的原生读取，不新增轮询。它不伪造 live events、cursor、terminal 完成时间或历史回放，也不清理 pending requests。
+
+关联仍受原有 TTL/limit 约束；无效回执不会续期。过期/淘汰后缺少可验证的请求到 turn 关联，普通 idle、历史读取或无法关联的同 ID 数据不会解除 UNKNOWN。不会建立永久的第二份关联库来猜测恢复；只有独立权威证据能结束无法关联的风险，实际管理子进程退出是既有的这类边界。

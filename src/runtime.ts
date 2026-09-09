@@ -590,6 +590,23 @@ export class RuntimeStore {
     }
   }
 
+  // Called only after a fresh, scoped native thread/read proves idle + the
+  // matching terminal turn. Preserve live terminal evidence and pending requests;
+  // a persisted read cannot manufacture live events, cursors or a completion time.
+  confirmRecoveredThreadRead(threadId: string, turnId: string): boolean {
+    this.ensureThread(threadId);
+    const runtime = this.#threads.get(threadId)!;
+    // Evidence for this finished turn does not authorize changing another
+    // turn's live active marker. Its restart guard remains independent.
+    if (runtime.activeTurnId !== null && runtime.activeTurnId !== turnId) return true;
+    runtime.activeTurnId = null;
+    runtime.status = "idle";
+    this.#turnToThread.delete(turnId);
+    this.#signalChange(runtime);
+    this.#publishUx();
+    return true;
+  }
+
   recordLateMutationError(input: LateMutationError): void {
     this.ensureThread(input.threadId);
     const runtime = this.#threads.get(input.threadId)!;

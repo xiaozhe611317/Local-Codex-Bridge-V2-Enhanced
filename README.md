@@ -1,4 +1,38 @@
-# Local Codex Bridge
+# Local Codex Bridge V2 Enhanced
+
+**Community enhanced derivative of [zoeynine/Local-Codex-Bridge](https://github.com/zoeynine/Local-Codex-Bridge), originally authored by [zoeynine](https://github.com/zoeynine). This is an independently maintained community edition, not an official upstream release.**
+
+**本仓库是基于原作者 [zoeynine](https://github.com/zoeynine) 的 [Local-Codex-Bridge](https://github.com/zoeynine/Local-Codex-Bridge) 的社区二开增强版，不代表上游官方发布。** 原项目 MIT 许可证及版权声明完整保留于 [LICENSE](LICENSE)。
+
+“V2 Enhanced” is a repository-level edition identity only. Package/runtime version remains **2.1.3**. / “V2 Enhanced” 仅标识本仓库增强版，包与运行时版本仍为 **2.1.3**，不声明新的上游版本。
+
+## What this enhanced edition adds / 二开增强
+
+Compared with local baseline `72f972ee8c6ae083e282f4d30fa9d0b375910b0b`, accepted implementation `742633f929ab3c5aed88c74b61b52628af831125` contains **6 implementation commits, 35 changed files, 3,888 insertions and 77 deletions**, before publication documentation. The baseline is a local v2.1.3 source snapshot, **not an upstream Git commit or tag**. See [baseline provenance](DEV-BASELINE-NOTES.md), [validation evidence](DEVELOPMENT-VALIDATION.md) and [protocol assumptions](PROTOCOL-ASSUMPTIONS.md).
+
+下表对比本地 2.1.3 快照与已接受实现；基线没有携带上游 Git 历史，本地 SHA 不能当作上游版本身份，也不代表与当前上游 HEAD 的差异。
+
+| Area / 项目 | Upstream-derived local baseline / 上游来源本地基线 | This edition / 本版增强 |
+| --- | --- | --- |
+| Public tools / 公开工具 | 8 tools, including `codex_checkpoint` / 已包含 checkpoint | **10 tools**: adds `bridge_status` and `codex_runtime` / 新增运行身份与子进程管理工具 |
+| Runtime identity / 运行身份 | No public status tool / 无公开状态工具 | Read-only version, compiled build fingerprint, PID, uptime and live runtime counts; missing evidence stays unavailable / 只读身份与计数，缺失证据不猜测 |
+| Managed recovery / 受控恢复 | No public managed-child restart tool / 无公开子进程重启工具 | `codex_runtime` status/restart for the managed app-server child; active turns, pending requests, in-flight operations and unresolved UNKNOWN mutations block restart / 活动或不确定状态下拒绝重启 |
+| Incremental observation / 增量观察 | Caller-managed raw cursor/history reads / 调用方管理 cursor 与原始读取 | Auto/supervision/raw modes, bounded per-connection/thread delivery cursors, low-noise deltas and related diagnostics; manual cursors remain independent; cursor loss/restart requires re-anchor / 自动增量、降噪与丢失后重新锚定 |
+| Context evidence / 上下文证据 | Existing explicit sandbox/approval validation / 已有显式权限校验 | Separates requested settings, native thread evidence and accepted-turn effective evidence for cwd/sandbox/approval/model/effort; settings stay unverified when the protocol cannot prove them / 区分请求与原生证据，未知不冒充已生效 |
+| Targeting / 目标目录 | Native absolute cwd validation / 原生绝对路径校验 | Optional `allowed_roots` with fail-closed canonicalization and Windows traversal, symlink/junction and case-boundary checks; **not an OS sandbox** / 可选目录范围校验，不构成操作系统沙箱 |
+| Project aliases / 项目别名 | No project alias input / 无项目别名输入 | `project_alias` maps only to an absolute cwd, remains subject to `allowed_roots`, and cannot set privileges, sandbox, approval, model or effort / 别名只选目录，不能提升权限或改变模型 |
+| Protocol hardening / 协议加固 | UNKNOWN timeout semantics and scoped pending responses already existed / 已有超时 UNKNOWN 与请求作用域校验 | Stricter late acknowledgements, malformed/unsupported/contradictory lifecycle evidence and pending-resolution scoping; bounded exact recovery evidence and conservative restart guards / 强化迟到回执、矛盾状态与精确恢复证据 |
+| Architecture / 架构 | Native threads/history remain authoritative / 原生线程与历史为事实源 | Preserved: supervisor decides, Bridge provides transport/control/evidence, Codex executes; no second transcript database, task queue or job runtime / 保持薄层，不新增平行任务或历史系统 |
+
+The original eight tools are `codex_threads`, `codex_models`, `codex_turn`, `codex_observe`, `codex_steer`, `codex_respond`, `codex_interrupt` and `codex_checkpoint`. Evidence: [tools](src/tools.ts), [original contract regression](test/tool-contract.test.ts), [status](src/bridge-status.ts), [runtime](src/app-server.ts), [observation](src/observation-transport.ts), [context](src/context-verification.ts), [targeting](src/targeting.ts), and [recovery](src/late-turn-recovery.ts).
+
+## Security boundaries / 安全边界
+
+`allowed_roots` and aliases govern Bridge's cwd targeting only; they do not restrict all native file/command capabilities, thread visibility, or filesystem changes after validation. Native Codex sandbox/approval policy and the local OS user's permissions remain the execution boundaries. / 目录范围和别名只约束 Bridge 的目标选择，不是 OS sandbox、ACL 或多租户隔离。
+
+`codex_runtime.restart` affects **only the app-server child managed by this Bridge**. It does not restart Bridge or Tunnel and does not automatically retry mutations or restart a failed child. / 重启仅针对当前 Bridge 管理的 app-server 子进程，不重启 Bridge/Tunnel，不自动重试。
+
+Keep Tunnel profiles, authentication material, API keys, `.env*`, actual `windows/local-settings.json`, ignored logs and backups outside Git. Examples use placeholders; configure each machine locally. / Tunnel 与认证凭据、本机配置和私有日志不得进入 Git。Build output, dependencies and `_codex_tmp` remain ignored.
 
 *A thin supervisory MCP bridge between external AI supervisors and native Codex.*
 
@@ -240,8 +274,8 @@ Bridge 不自动替 supervisor 做这种 retry。
 ### Clone、构建与测试
 
 ```powershell
-git clone https://github.com/zoeynine/Local-Codex-Bridge.git
-cd Local-Codex-Bridge
+git clone https://github.com/xiaozhe611317/Local-Codex-Bridge-V2-Enhanced.git
+cd Local-Codex-Bridge-V2-Enhanced
 npm ci
 npm run typecheck
 npm run build
@@ -261,7 +295,7 @@ npm start
 
 ```text
 command: node
-args:    C:\absolute\path\to\Local-Codex-Bridge\dist\src\index.js
+args:    C:\absolute\path\to\Local-Codex-Bridge-V2-Enhanced\dist\src\index.js
 env:     CODEX_EXE=C:\path\to\codex.exe   # optional
 ```
 
@@ -534,6 +568,12 @@ npm run smoke:live
 
 MIT License — see [`LICENSE`](LICENSE).
 
+## Attribution / 致谢与来源
+
+Original project and author: **[zoeynine / Local-Codex-Bridge](https://github.com/zoeynine/Local-Codex-Bridge)**, GitHub account **[zoeynine](https://github.com/zoeynine)**. This community edition builds on that project's thin native-Codex supervision architecture and preserves its existing MIT license and copyright notice unchanged. The enhancements are published independently under the same MIT terms; they do not imply upstream endorsement or an official release. See [NOTICE.md](NOTICE.md).
+
+原项目与原作者为 **zoeynine / Local-Codex-Bridge**。感谢原作者及原项目贡献者；本仓库保留原 MIT 许可及版权声明，增强部分沿用 MIT 条款，独立发布，不代表上游背书。下列原项目致谢一并保留。
+
 ## 协作贡献者与致谢
 
 协作贡献者：**小年（ChatGPT）**、**Codex**。
@@ -542,9 +582,9 @@ MIT License — see [`LICENSE`](LICENSE).
 
 以及谢谢**予安**，没有你我也不会试着去做些什么ღ( ´･ᴗ･` )
 
-## 隔离开发增强（沿用 2.1.3 版本号，尚未发布）
+## 增强实现详情（沿用 2.1.3 版本号，社区版）
 
-本工作树增加以下功能；它不代表官方新版本，也不包含 Goal mode passthrough、第二套 agent/job runtime、重试队列或新的持久任务库。
+本社区版增加以下功能；它不代表官方新版本，也不包含 Goal mode passthrough、第二套 agent/job runtime、重试队列或新的持久任务库。
 
 ### 运行身份与受控恢复
 

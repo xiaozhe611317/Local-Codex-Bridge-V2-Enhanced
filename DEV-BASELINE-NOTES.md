@@ -1,6 +1,6 @@
 # Local development baseline
 
-- Source: D:\CodexBridge\upstream\Local-Codex-Bridge
+- Source: a separate read-only local copy of [zoeynine/Local-Codex-Bridge](https://github.com/zoeynine/Local-Codex-Bridge); the machine-local source path is omitted from this public note.
 - Version: 2.1.3. Source has no .git metadata; this is a local snapshot baseline, not an upstream commit/tag.
 - Captured at: 2026-09-08T19:48:09.625Z
 - Manifest SHA-256: e3c530cb44518ab8992b0dec9f9067440bb9bd027412141d092da0dc3d674bb4
@@ -12,7 +12,7 @@
 - High-confidence secret signature screening of included files found no matches. This bounded screen cannot rule out arbitrary embedded credentials.
 - Stable source, Tunnel configuration, Codex login, global Git configuration and system settings were not modified.
 
-- Backup: D:\CodexBridge\backups\stable-v2.1.3-pre-enhancements-20260909
+- Backup: a separate machine-local pre-enhancement backup, outside this publication and not included in Git.
 - Branch: feat/supervisor-enhancements.
 - Repository-only author: Local Codex Bridge Dev <local@localhost.invalid>.
 - Git is initialized only in this dev directory; automatic line-ending conversion is disabled locally to retain bytes.
@@ -34,3 +34,17 @@
 - All 80 copied source files were verified against the saved source manifest before the dev .gitignore amendment.
 - Later dev verification permits only that documented .gitignore amendment. The stable source and backup retain the original.
 - Source is checked again after Git initialization. INITIALIZATION-REPORT.json in the backup records the final check and commit.
+
+## Published history relationship
+
+The local baseline commit is `72f972ee8c6ae083e282f4d30fa9d0b375910b0b`.
+The accepted enhanced implementation is `742633f929ab3c5aed88c74b61b52628af831125`:
+six descendant implementation commits, changing 35 files with 3,888 insertions
+and 77 deletions. Publication documentation is committed after that accepted
+implementation; no implementation commits are rewritten.
+
+The source copy had no upstream `.git` metadata. These local commit IDs therefore
+do not identify upstream Git commits or tags, and the published local history
+does not reproduce the upstream project's contributor history. Attribution is
+recorded explicitly in [README.md](README.md), [NOTICE.md](NOTICE.md), and the
+unchanged [LICENSE](LICENSE).

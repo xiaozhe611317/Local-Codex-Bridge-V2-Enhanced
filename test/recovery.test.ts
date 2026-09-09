@@ -427,3 +427,53 @@ test("native evidence B: a read predating contradictory evidence for its bound t
     assert.equal(native.status().safe_to_restart, true);
   } finally { await native.close(); }
 });
+
+test("fast recovery A: conversationId conflict invalidates an older thread/read", async () => {
+  const { native, control } = setup({ requestTimeoutMs: 200 });
+  try {
+    await start(native); await ack(native);
+    await notify(native, "turn/started", { threadId: "thread", turn: { id: "turn-a", status: "inProgress" } });
+    await native.request("test/read-result", { result: readResult(), hold: true });
+    const pending = native.request("thread/read", { threadId: "thread", includeTurns: true });
+    await native.request("test/barrier", {});
+    await notify(native, "thread/status/changed", { conversationId: "thread", thread: { id: "other" }, status: { type: "active" } });
+    await native.request("test/release-read", {}); await pending;
+    await unsafe(native, control);
+    assert.equal(native.runtime.observe("thread", 0, 100)!.active_turn_id, "turn-a");
+    await read(native, readResult());
+    assert.equal(native.status().safe_to_restart, true);
+  } finally { await native.close(); }
+});
+test("fast recovery A: malformed bound-turn start invalidates a prior terminal recovery fact", async () => {
+  const { native, control } = setup();
+  try {
+    await start(native); await ack(native);
+    await notify(native, "turn/completed", terminal());
+    const prior = native.runtime.observe("thread", 0, 100)!.terminal;
+    await notify(native, "turn/started", { conversationId: "thread", turn: { id: "turn-a", status: "futureState" } });
+    assert.deepEqual(native.runtime.observe("thread", 0, 100)!.terminal, prior);
+    await notify(native, "thread/status/changed", idle());
+    await unsafe(native, control);
+    await notify(native, "turn/completed", terminal());
+    assert.equal(native.status().safe_to_restart, true);
+  } finally { await native.close(); }
+});
+test("fast recovery B: late resume, steer and interrupt validate scope before settling UNKNOWN", async (t) => {
+  for (const [method, params, invalid, valid] of [
+    ["thread/resume", { threadId: "thread" }, { thread: { id: "thread", threadId: "other" } }, { thread: { id: "thread" } }],
+    ["turn/steer", { threadId: "thread", expectedTurnId: "turn-a", input: [] }, { turnId: "turn-a", conversationId: "other" }, { turnId: "turn-a" }],
+    ["turn/interrupt", { threadId: "thread", turnId: "turn-a" }, { turn: [] }, {}],
+  ] as const) await t.test(method, async () => {
+    const { native, control } = setup();
+    native.runtime.ensureThread("thread");
+    try {
+      await assert.rejects(native.request(method, params), /UNKNOWN/);
+      const cursor = native.runtime.currentCursor("thread");
+      await native.request("test/ack-result", { method, result: invalid });
+      await unsafe(native, control);
+      assert.equal(native.runtime.currentCursor("thread"), cursor);
+      await native.request("test/ack-result", { method, result: valid });
+      assert.equal(native.status().safe_to_restart, true);
+    } finally { await native.close(); }
+  });
+});

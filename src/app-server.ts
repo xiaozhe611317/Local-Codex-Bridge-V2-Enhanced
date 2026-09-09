@@ -10,6 +10,7 @@ import {
 } from "./runtime.js";
 import { platformPolicyFor, type PlatformPolicy } from "./platform.js";
 import { VERSION } from "./version.js";
+import { consistentNativeAcknowledgement } from "./native-evidence.js";
 import { observeRecoveryNotification, responseTurn, terminalThreadRead, type LateTurnEvidence } from "./late-turn-recovery.js";
 
 const MAX_JSONL_BYTES = 10 * 1024 * 1024;
@@ -783,7 +784,7 @@ export class AppServerManager {
     if (candidate.method === "thread/start" || candidate.method === "thread/resume") {
       const threadId = boundedScopeId(asRecord(result.thread)?.id);
       if (
-        !threadId ||
+        !threadId || !consistentNativeAcknowledgement(result, { threadId }, "thread") ||
         (candidate.method === "thread/resume" &&
           threadId !== candidate.requestedThreadId)
       ) {
@@ -798,7 +799,8 @@ export class AppServerManager {
     }
 
     if (candidate.method === "turn/steer" || candidate.method === "turn/interrupt") {
-      if (candidate.method === "turn/steer" && result.turnId !== candidate.requestedTurnId) return false;
+      if (!consistentNativeAcknowledgement(result, { threadId: candidate.requestedThreadId, turnId: candidate.requestedTurnId }, "turn") ||
+          (candidate.method === "turn/steer" && result.turnId !== candidate.requestedTurnId)) return false;
       this.runtime.reconcileLateMutationSuccess({
         method: candidate.method,
         threadId: candidate.requestedThreadId,
@@ -819,7 +821,8 @@ export class AppServerManager {
     // A scoped turn id alone cannot settle a timed-out mutation. Validate the
     // native Turn status before reconciliation can preserve an older idle state.
     // Thread/Bridge states (for example idle) are not supported Turn statuses.
-    if (typeof status !== "string" || !["inProgress", "completed", "failed", "interrupted"].includes(status)) {
+    if (typeof status !== "string" || !["inProgress", "completed", "failed", "interrupted"].includes(status) ||
+        !consistentNativeAcknowledgement(result, { threadId: candidate.requestedThreadId, turnId }, "turn")) {
       this.runtime.recordDiagnostic("mutation_outcome_unknown", {
         method: candidate.method, reason: "invalid_late_turn_status",
       }, candidate.requestedThreadId, turnId);

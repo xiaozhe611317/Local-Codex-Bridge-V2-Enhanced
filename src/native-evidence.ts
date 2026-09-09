@@ -18,6 +18,16 @@ export function nativeTurnReferences(value: unknown): string[] {
   return [data?.turnId, turn?.id, turn?.turnId, object(data?.item)?.turnId, object(data?.thread)?.turnId]
     .map(id).filter((value): value is string => value !== undefined);
 }
+
+export function nativeThreadReferences(value: unknown): string[] {
+  const data = object(value);
+  return [data?.threadId, data?.conversationId, object(data?.thread)?.id,
+    ...["thread", "turn", "item"].flatMap(key => {
+      const record = object(data?.[key]);
+      return [record?.threadId, record?.conversationId];
+    })].map(id).filter((value): value is string => value !== undefined);
+}
+
 interface NativeScope { threadId?: string; turnId?: string; }
 export function consistentNativeScope(value: unknown, expected: NativeScope = {}): boolean {
   const data = object(value);
@@ -70,4 +80,17 @@ export function responseTurn(value: unknown, threadId: string, boundTurnId?: str
   if (!result || !turn || !turnId || (boundTurnId !== undefined && boundTurnId !== turnId) ||
       !consistentNativeScope(result, { threadId, turnId })) return undefined;
   return turn as Record<string, unknown> & { id: string };
+}
+
+export function consistentNativeAcknowledgement(value: unknown, expected: NativeScope, kind: "thread" | "turn"): boolean {
+  if (!consistentNativeScope(value, expected)) return false;
+  const data = object(value)!;
+  const statusOf = (status: unknown, type: "thread" | "turn"): string | undefined =>
+    type === "thread" ? nativeThreadStatus(status) : status === "inProgress" || terminalStatus(status) ? status : undefined;
+  for (const [record, type] of [[data, kind], [object(data.thread), "thread"], [object(data.turn), "turn"]] as const) {
+    if (record && Object.hasOwn(record, "status") && statusOf(record.status, type) === undefined) return false;
+  }
+  const nested = object(data[kind]);
+  return !Object.hasOwn(data, "status") || !nested || !Object.hasOwn(nested, "status") ||
+    statusOf(data.status, kind) === statusOf(nested.status, kind);
 }

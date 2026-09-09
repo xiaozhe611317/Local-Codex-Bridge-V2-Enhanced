@@ -1,6 +1,6 @@
 // Bounded facts attached to one existing late-response correlation, not a
 // second thread/job registry. Native payloads are validated without coercion.
-import { consistentNativeScope, id, idleStatus, nativeTurnReferences, object, responseTurn, terminalStatus, type TerminalStatus } from "./native-evidence.js";
+import { consistentNativeScope, id, idleStatus, nativeThreadReferences, nativeTurnReferences, object, responseTurn, terminalStatus, type TerminalStatus } from "./native-evidence.js";
 export { responseTurn } from "./native-evidence.js";
 export interface LateTurnEvidence {
   turnId: string;
@@ -13,32 +13,28 @@ export function observeRecoveryNotification(
   evidence: LateTurnEvidence, threadId: string, method: string, params: unknown, sequence: number,
 ): void {
   const data = object(params);
-  if (data?.threadId !== threadId) {
-    // Contradictory scope may invalidate an older read, never prove recovery.
-    if (nativeTurnReferences(data).includes(evidence.turnId)) {
-      evidence.lastSequence = sequence;
-      evidence.idle = false;
-    }
-    return;
-  }
+  const threadReferences = nativeThreadReferences(data);
+  if (!threadReferences.includes(threadId) && !nativeTurnReferences(data).includes(evidence.turnId)) return;
   evidence.lastSequence = sequence;
-  if (!consistentNativeScope(data, { threadId })) {
+  // All supported aliases can invalidate freshness. Contradictory or missing
+  // thread scope supplies no positive evidence, and invalidates the old pair.
+  if (!threadReferences.includes(threadId) || !consistentNativeScope(data, { threadId })) {
     evidence.idle = false;
-    if (method === "turn/started" || method === "turn/completed") evidence.terminal = null;
+    evidence.terminal = null;
     return;
   }
   if (method === "turn/started") {
-    const startedId = id(object(data.turn)?.id ?? data.turnId);
-    if (!startedId || startedId === evidence.turnId) evidence.terminal = null;
+    const turn = responseTurn(data, threadId);
+    if (!turn || turn.status !== "inProgress" || turn.id === evidence.turnId) evidence.terminal = null;
     evidence.idle = false;
   } else if (method === "thread/status/changed") {
-    evidence.idle = idleStatus(data.status);
+    evidence.idle = idleStatus(data?.status);
   } else if (method === "turn/completed") {
-    const turn = object(data.turn);
-    if (turn?.id === evidence.turnId) {
-      const scoped = responseTurn(data, threadId, evidence.turnId);
-      evidence.terminal = scoped && terminalStatus(scoped.status) ? scoped.status : null;
-    }
+    const turn = responseTurn(data, threadId);
+    if (!turn || !terminalStatus(turn.status)) {
+      evidence.terminal = null;
+      evidence.idle = false;
+    } else if (turn.id === evidence.turnId) evidence.terminal = turn.status;
   }
 }
 export function terminalThreadRead(value: unknown, threadId: string, turnId: string): boolean {

@@ -9,7 +9,13 @@ const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infini
 lines.on("line", line => {
   const m = JSON.parse(line), p = m.params ?? {};
   if (m.method === "initialize") send({ id: m.id, result: { userAgent: "recovery-fixture" } });
-  else if (m.method === "turn/start") {
+  else if (["thread/start", "thread/resume", "turn/steer", "turn/interrupt"].includes(m.method)) {
+    if (starts.size >= 32) throw new Error("Fixture capacity exceeded");
+    starts.set(m.method, m);
+  } else if (m.method === "test/ack-result") {
+    send({ id: starts.get(p.method).id, result: p.result });
+    send({ id: m.id, result: {} });
+  } else if (m.method === "turn/start") {
     if (starts.size >= 32) throw new Error("Fixture capacity exceeded");
     starts.set(p.input[0].text, m);
   } else if (m.method === "test/ack") {

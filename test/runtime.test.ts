@@ -112,7 +112,7 @@ test("runtime ring uses monotonic cursors, scopes pending raw ids, and captures 
   assert.equal(observed.runtime_status, "completed");
 });
 
-test("turn/completed without a usable status projects unknown", () => {
+test("turn/completed without a usable status preserves the active guard without a terminal", () => {
   const runtime = new RuntimeStore();
   runtime.markTurnAccepted("thread-unknown", "turn-unknown");
 
@@ -123,7 +123,8 @@ test("turn/completed without a usable status projects unknown", () => {
 
   const observed = runtime.observe("thread-unknown", 0, 10)!;
   assert.equal(observed.runtime_status, "unknown");
-  assert.equal(observed.terminal?.status, "unknown");
+  assert.equal(observed.active_turn_id, "turn-unknown");
+  assert.equal(observed.terminal, null);
 });
 
 test("streamed agent text stays unchanged under its bound and retains the tail over it", () => {

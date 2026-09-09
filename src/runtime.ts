@@ -1,3 +1,5 @@
+import { consistentNativeScope, id as nativeId, nativeThreadStatus, nativeTurnReferences, responseTurn, terminalStatus } from "./native-evidence.js";
+
 export type RpcId = string | number;
 
 export const MAX_OBSERVE_WAIT_MS = 10_000;
@@ -626,6 +628,18 @@ export class RuntimeStore {
     );
   }
 
+  #invalidNativeNotification(method: string, params: unknown, threadId?: string, turnId?: string): void {
+    // Raw delivery still advances exactly once, but cannot manufacture lifecycle
+    // authority or remove active/pending guards. Keep earlier terminal evidence.
+    const scopedThread = nativeId(threadId);
+    this.recordDiagnostic("protocol_error", { method, reason: "invalid_native_notification_evidence" }, scopedThread, nativeId(turnId));
+    if (!scopedThread) return;
+    this.ensureThread(scopedThread);
+    const runtime = this.#threads.get(scopedThread)!;
+    runtime.status = "unknown";
+    this.#appendEvent(runtime, method, params, nativeId(turnId));
+  }
+
   recordNotification(method: string, params: unknown): void {
     const turnId = extractTurnId(params);
     const threadId = extractThreadId(params) ?? (turnId ? this.#turnToThread.get(turnId) : undefined);
@@ -635,6 +649,10 @@ export class RuntimeStore {
       if (typeof requestId === "string" || typeof requestId === "number") {
         const key = idKey(requestId);
         const pending = this.#pending.get(key);
+        if (pending && !consistentNativeScope(params, { threadId: pending.threadId, ...(pending.turnId ? { turnId: pending.turnId } : {}) })) {
+          this.#invalidNativeNotification(method, params, pending.threadId, pending.turnId);
+          return;
+        }
         this.#pending.delete(key);
         if (pending && this.#responding.get(key) === pending) {
           this.#responding.delete(key);
@@ -650,14 +668,25 @@ export class RuntimeStore {
       return;
     }
 
+    const owners = new Set(nativeTurnReferences(params).map(id => this.#turnToThread.get(id)).filter(id => id !== undefined));
+    const mappedThreadId = owners.size === 1 ? owners.values().next().value : undefined;
+    if (!consistentNativeScope(params, { threadId: mappedThreadId ?? threadId, ...(turnId ? { turnId } : {}) })) {
+      this.#invalidNativeNotification(method, params, owners.size > 1 ? undefined : mappedThreadId ?? threadId, turnId);
+      return;
+    }
     this.ensureThread(threadId);
     const runtime = this.#threads.get(threadId)!;
-    if (method === "turn/started" && turnId) {
-      runtime.activeTurnId = turnId;
+    if (method === "turn/started") {
+      const turn = responseTurn(params, threadId);
+      if (!turn || turn.status !== "inProgress") {
+        this.#invalidNativeNotification(method, params, threadId, turnId);
+        return;
+      }
+      runtime.activeTurnId = turn.id;
       runtime.status = "inProgress";
       runtime.terminal = null;
       runtime.agentText = "";
-      this.#turnToThread.set(turnId, threadId);
+      this.#turnToThread.set(turn.id, threadId);
     }
 
     const agentText = extractAgentText(method, params);
@@ -670,8 +699,12 @@ export class RuntimeStore {
     }
 
     if (method === "turn/completed") {
-      const turn = asRecord(asRecord(params)?.turn);
-      const terminalTurnId = stringField(turn, "id") ?? turnId ?? runtime.activeTurnId;
+      const turn = responseTurn(params, threadId);
+      if (!turn || !terminalStatus(turn.status)) {
+        this.#invalidNativeNotification(method, params, threadId, turnId);
+        return;
+      }
+      const terminalTurnId = turn.id;
       if (terminalTurnId) {
         if (runtime.activeTurnId && runtime.activeTurnId !== terminalTurnId) {
           this.recordDiagnostic("turn_terminal_conflict", {
@@ -684,7 +717,7 @@ export class RuntimeStore {
           this.#appendEvent(runtime, method, params, terminalTurnId);
           return;
         }
-        const status = stringField(turn, "status") ?? "unknown";
+        const status = turn.status;
         const error = turn?.error ?? null;
         const final = extractFinalFromTurn(params) ?? (runtime.agentText || null);
         runtime.status = status;
@@ -707,11 +740,12 @@ export class RuntimeStore {
         });
       }
     } else if (method === "thread/status/changed") {
-      const status = asRecord(params)?.status;
-      runtime.status =
-        typeof status === "string"
-          ? status
-          : stringField(asRecord(status), "type") ?? "unknown";
+      const status = nativeThreadStatus(asRecord(params)?.status);
+      if (status === undefined) {
+        this.#invalidNativeNotification(method, params, threadId, turnId);
+        return;
+      }
+      runtime.status = status;
     }
 
     this.#appendEvent(runtime, method, params, turnId);

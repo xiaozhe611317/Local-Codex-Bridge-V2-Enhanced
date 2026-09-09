@@ -4,11 +4,14 @@ import { sanitizeForTransport } from "./runtime.js";
 import { RuntimeStore } from "./runtime.js";
 import { ControlSurface } from "./tools.js";
 import { createUxProjectionFromEnvironment } from "./ux-projection.js";
-import { localCodexPrefixArgs } from "./local-config.js";
+import { localCodexPrefixArgs, localTargetingConfig } from "./local-config.js";
+import { platformPolicyFor } from "./platform.js";
+import { TargetingPolicy } from "./targeting.js";
 
 const uxProjection = createUxProjectionFromEnvironment();
 const appServer = new AppServerManager(new RuntimeStore(256, uxProjection), { prefixArgs: localCodexPrefixArgs() });
-const control = new ControlSurface(appServer);
+const platform = platformPolicyFor();
+const control = new ControlSurface(appServer, undefined, platform, new TargetingPolicy(localTargetingConfig(), platform));
 
 let shuttingDown = false;
 let server: McpStdioServer;

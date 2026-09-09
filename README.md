@@ -81,7 +81,7 @@ Windows 与 macOS 共用同一核心 Bridge，实现差异只保留在平台原�
 
 ------
 
-## 8 个 MCP 工具
+## 10 个 MCP 工具（当前开发候选）
 
 | Tool               | 用途                                                         | 边界                                                         |
 | ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
@@ -92,6 +92,8 @@ Windows 与 macOS 共用同一核心 Bridge，实现差异只保留在平台原�
 | `codex_steer`      | 对同一个 active turn 追加语义纠正或新意图                    | 不是 timer、polling 或 retry 机制                            |
 | `codex_respond`    | 回答真实存在且 Bridge 明确支持的 approval / user-input / permission request | 必须保留原始 request id 和准确 scope；不支持 elicitation     |
 | `codex_interrupt`  | 中断准确的 active thread / turn                              | 只发送原生 interrupt，不重启 Bridge 或 app-server            |
+| `bridge_status` | 读取当前运行 Bridge 身份、进程与 live 状态 | 不启动子进程；未知字段明确 unavailable |
+| `codex_runtime` | 读取或显式重启所管理的 app-server 子进程 | 有 active/pending/in-flight 时 RESTART_DENIED；重新握手 |
 | `codex_checkpoint` | 保存可选、精简、有界的 supervisory anchor                    | 不是 transcript、job id 或 Codex history 的替代品            |
 
 完整 schema 与运行时限制以 [`src/tools.ts`](src/tools.ts) 为准。
@@ -165,6 +167,8 @@ codex_observe
     ↓
 terminal state / acceptance
 ```
+
+普通观察省略 cursor，即使用内置 auto 协议；不必回填 codex_turn 的 event_cursor。supervisor 只需判断新的证据、审批和验收。
 
 几个重要原则：
 
@@ -412,7 +416,7 @@ Bridge 的：
 
 主要存在于内存中。
 
-Bridge 重启后，`codex_observe` 可以从 native persisted history 回退恢复有限观察信息，但不会伪造已经丢失的 live state。
+Bridge 重启后，默认 auto 会要求 re-anchor 并明确 live state 无法重建；显式 manual cursor 的取证读取仍可回退到有限 native persisted history，不伪造丢失的 live state。
 
 ### Checkpoint
 
@@ -515,7 +519,7 @@ npm run smoke:live
 
 - `src/mcp.ts` — MCP stdio / JSON-RPC boundary
 - `src/app-server.ts` — native Codex app-server process / protocol adapter
-- `src/tools.ts` — 8 tools、schema 与 supervisory semantics
+- `src/tools.ts` — 10 tools、schema 与 supervisory semantics
 - `src/runtime.ts` — bounded live runtime state / events / pending requests
 - `src/checkpoint.ts` — optional supervisory checkpoint
 - `src/platform.ts` — Windows / macOS platform boundary
@@ -537,3 +541,93 @@ MIT License — see [`LICENSE`](LICENSE).
 谢谢一起把“让外部 AI 真正监督 native Codex”从一个小想法，一点点压成了一层足够薄、边界足够清楚、也愿意公开给别人继续折腾的 Bridge。`(*╹▽╹*)`
 
 以及谢谢**予安**，没有你我也不会试着去做些什么ღ( ´･ᴗ･` )
+
+## 隔离开发增强（沿用 2.1.3 版本号，尚未发布）
+
+本工作树增加以下功能；它不代表官方新版本，也不包含 Goal mode passthrough、第二套 agent/job runtime、重试队列或新的持久任务库。
+
+### 运行身份与受控恢复
+
+`bridge_status {}` 只读返回当前 Bridge 的编译版本常量、构建时嵌入的 SHA-256、实际 PID 和 process uptime。构建指纹来自 `npm run build` 对排序后的 `dist/src/*.js`（排除指纹模块本身）的哈希，带文件名和字节长度分隔；它不从启动目录的 Git HEAD、包文件或环境变量推断运行身份。直接 tsc/源码运行没有该指纹时返回 unavailable。哈希用于区分构建产物，不是签名或来源认证。
+
+`codex_runtime { "action": "status" }` 不启动子进程。它返回 Bridge 管理的 app-server 的状态、可取得时的 PID、握手状态、live generation、active turn/pending request 数量与 `safe_to_restart`。未启动、已退出或无法取得 PID 时返回 null/unavailable；不扫描其他 Codex 实例，不返回请求内容、环境、登录信息或 Tunnel 设置。
+
+`codex_runtime { "action": "restart" }` 只终止并重新启动当前 Bridge 管理的 app-server 子进程，然后重新执行 initialize/initialized。Bridge 和 Tunnel 都不重启。任何 active turn、pending approval/user-input（包括没有 turn_id 的请求）、正在执行的 RPC/写入/turn 启动事务、关闭或重启操作都会导致 `RESTART_DENIED`。已发送 mutation 超时且原子进程仍存活时，因 outcome UNKNOWN 也拒绝重启；这项保守锁定不会随 late-response retention 到期而自行解除。有效且作用域匹配的迟到原生回执可解除对应 UNKNOWN；没有这种证据时继续保守锁定，进程实际退出后才可显式恢复。
+
+异常退出仍然锁定错误，后续普通调用不会自动重启；重启握手失败也不会重试。status 是瞬时快照，restart 会在实际执行时再次检查并同步取得排他门闩。工具 annotation 覆盖两种 action，所以 codex_runtime 整体标记为可能修改/破坏状态；status action 本身只读。
+
+确认旧子进程退出后，Bridge 清除旧 live ring、pending、terminal 与 turn 映射并发布清零的 UX counts。generation 增加。旧线程在重新出现前，auto 明确要求 re-anchor；显式 manual 取证可走已有 degraded thread/read，其 cursor 不是有效 live cursor。重新出现的 live 线程使用高于上一 generation 的 cursor floor，旧 cursor 会报告丢失，不重放旧事件。checkpoint 与原生持久线程不变。重启后不能宣称旧 live state 已重建。
+
+### 默认 auto：只传本次增量，异常时局部展开
+
+普通监督只需调用：
+
+```json
+{"thread_id": "native-thread-id", "wait_ms": 10000}
+```
+
+`mode` 支持 `auto | supervision | raw`，默认为 auto。**GPT=supervisor，Bridge=transport/control/evidence，Codex=executor。** 降噪、自动 cursor 和异常证据选择由 Bridge 实现，安装后不需要另给 GPT 一套压缩日志提示词；Bridge 不生成计划、不调度新任务，也不代替 supervisor 判断验收。
+
+| 调用方式 | cursor 与返回行为 |
+| --- | --- |
+| 省略 mode/cursor，或 mode=auto 且无 cursor | 每连接/线程自动消费；正常为 supervision；异常时附加相关局部 raw 证据 |
+| mode=supervision 且无 cursor | 同一自动 cursor；强制低噪声，不附加自动 raw 扩展 |
+| mode=raw 且无 cursor | 显式调试/取证；返回自动 cursor 之后的原始页 |
+| 显式 cursor，mode 省略/auto/raw | 独立 manual raw 分页，保留原有 cursor/fallback/snapshot 语义；不改变自动 cursor |
+| 显式 cursor，mode=supervision | 独立 manual 分页并过滤噪声；不改变自动 cursor |
+
+自动状态限定于一个 MCP 连接，最多保留 128 个线程的消费元数据，不保存聊天或事件副本。结果成功写回 stdio 后才提交 cursor；取消或写入失败回滚消费。同连接/线程的并发自动 observe 会明确拒绝，避免两个调用重复消费；没有等待队列或重试循环。manual 调用可独立取证。连接结束清除自动状态，容量淘汰或 generation 改变会要求 re-anchor；不能猜出丢失的消费进度。
+
+普通 events 只来自本次原始页，已消费事件不会在下一次自动调用重放。自动模式的 pending_requests 只返回新出现的请求，pending_request_count 保留当前数量；terminal 只在快照变化时返回，terminal_unchanged 明示已有但未变化。manual 读取继续返回原有完整当前 pending/terminal 快照。普通 auto/supervision 会省略 turn/completed 内嵌 items 和 terminal.turn 的整段 turn payload；同一 final 文本只发送一次，不重复携带已交付日志，显式 raw 仍保留取证数据。自动 pending 元数据最多 128 条；超限明确标记并要求 re-anchor/手动取证。
+
+supervision 精确抑制 `item/agentMessage/delta` 和 `thread/tokenUsage/updated` 通知，保留 command start/output/completion、file change、approval/user-input、warning/error、turn status、完整 agent item 和 terminal；server requests 不会作为通知过滤。limit 仍限制原始消费页。`next_cursor` 是原始页消费末尾，`current_cursor`、`cursor_floor`、`cursor_lost`、`has_more` 不因过滤而改变。空 events 也可能有真实 cursor 推进；自动模式由 Bridge 保存，manual 调用应保存返回的 next_cursor。`suppressed_events` 只统计本页被抑制的事件，不对已经丢失的 ring 内容编造计数。
+
+每次返回固定 `delta_summary` 六字段，空值为数组 []，每字段最多 8 条：
+
+- changes：原生 file/turn/status 的变化证据；
+- commands：本次命令开始、输出、完成的标识与短摘录；
+- validation：有明确 exitCode 时的 reported_command_exit；不推断“所有测试通过”或“任务验收完成”；
+- pending：新 pending 或 no_longer_pending；消失不等于被批准；
+- unresolved：本次新增异常代码/原生 warning/error；
+- next：基于真实状态的 inspect_pending_requests、inspect_local_evidence、observe_remaining_delta 或 re_anchor 提示；不会自行执行这些动作。
+
+auto 的局部扩展触发包括 cursor_lost、mutation outcome UNKNOWN、app-server unexpected exit/unavailable、restart failure、native/MCP JSON-RPC/protocol error、unknown pending request/state、turn/terminal 矛盾，以及非零 command exit 且输出缺失或超过短摘要预算。缺少有效迟到回执的 UNKNOWN 和仍不可用的子进程不会因“提示已读”而被推断为恢复。准确匹配的有效原生回执可解除对应 UNKNOWN；TTL 到期、缺字段或作用域不匹配不能解除。
+
+`diagnostics` 最多附加 6 条相关本线程 recent raw 摘录（序列化正文预算 6000 字符）、4 条 runtime 诊断元数据及 4 条连接错误响应。命令失败只展开相关命令；无从关联线程的协议错误只附加原错误响应，不重放无关线程历史。重复的持续异常不会重复附加旧 raw 内容。原始诊断摘录保留真实 cursor 并标明不推进主事件 cursor。进程/连接诊断 ring 各最多 32 条，全部为本地有界临时证据。
+
+异常消失或一次性协议错误已交付后，后续 auto 回到 supervision。低噪声模式不代表 task 成功，也不代表 supervisor 已恢复理解。cursor_lost、generation 变化、Bridge 重启后的 live unreconstructable 等返回 `reanchor.required`；应读取 checkpoint（若使用）和 native thread 重新锚定意图、硬约束与证据。自动 fallback 不拉取/重放 persisted history；它明确返回 live_state_reconstructable:false，live cursor 字段为 null/unavailable，不把零伪装成恢复后的有效 cursor。只有显式 manual 调试/取证路径继续原有 degraded thread/read fallback。
+
+checkpoint 仍是 Goal、硬约束、current state、validation/unresolved 摘要的可选持久快照：原始字段保存目标和约束，acceptance_status/current_understanding/next_step 保存精简验证与未决事项。Bridge 不会自动把 delta summary、完整聊天或 raw 日志写入 checkpoint，也不把 checkpoint 变成生命周期库。
+
+### requested 与 native evidence
+
+`codex_turn` 的原有 accepted/thread_id/turn_id/event_cursor/status 保留，新增 `context_verification`：
+
+- requested 记录调用方的 cwd/project_alias/sandbox/approval_policy/model/effort；selected_cwd 是 Bridge 选定的目标（可能来自 alias 或继承的原生 thread.cwd），不是生效证明。
+- native_thread_context.fields 仅投影这次 thread/start 或 thread/resume 的顶层 cwd/sandbox/approvalPolicy/model/reasoningEffort，逐字段附 source、verified、value 和 available/unknown；作用时点明确为 before_turn_start。
+- effective.fields 的作用域为 accepted_turn。当前受支持的 turn/start 只返回 Turn，没有这些设置的权威回读，故返回 verified:false、value:null、source:null、status:unknown。请求已接受、catalog 支持某模型/effort 或历史中出现过某模型都不能替代这个证据。
+
+显式 sandbox/approval 的既有 fail-closed 检查继续生效。没有建立 current-model registry/cache，也没有为省略 model/effort 的普通继续操作增加 model/list 或推测当前模型。
+
+### allowed_roots 与 project_alias
+
+使用已有 ignored `windows/local-settings.json` 的可选 `targeting` 对象；其他平台可用相同 JSON 结构。Bridge 只在启动时显式设置 `LOCAL_CODEX_BRIDGE_LOCAL_SETTINGS_FILE` 为该文件的绝对路径时读取，不搜索用户 home，不自动接入或修改 Tunnel profile。若通过外部 launcher 启动，须由其传递该变量；不需要改变 Tray 的进程身份与 no-auto-restart 行为。
+
+```json
+{
+  "targeting": {
+    "allowed_roots": ["C:\\Projects"],
+    "project_aliases": {
+      "demo": "C:\\Projects\\Demo"
+    }
+  }
+}
+```
+
+这些是占位路径，应替换为目标机器的绝对路径。macOS 使用 /absolute/paths。路径不展开环境变量、~ 或 URL 编码。alias 区分大小写，仅映射 cwd 字符串，不能包含 sandbox、approval、model、effort 等设置。cwd 与 project_alias 同时传入无条件拒绝；未知 alias 拒绝。
+
+未配置 allowed_roots 保留原有路径行为。显式空数组表示拒绝所有 turn 目标。配置后 fresh、resume 显式 cwd、alias 以及继承 cwd 均检查：继承时先 thread/read 读取目标并保留 resume/turn 的 cwd 省略语义；在 thread/start/resume 返回后还须验证顶层有效 cwd 存在、在范围内且与所选目标一致，再发送 turn/start。验证失败可能已创建/加载原生线程，但不会接着启动 turn，也不会自动重试。
+
+Windows 采用原生绝对 drive-letter 路径规范化、大小写不敏感的目录边界比较、stat/realpath 与逐级 link 检查。拒绝原始 .. 分量、UNC/device、ADS、保留设备名、尾随点/空格等歧义路径、缺失/不可读/非目录路径及 symlink/junction（包括 root 自身或祖先）。即使 link 指回允许范围内，也保守拒绝。规范与磁盘真实路径都须匹配范围，并以目录 file identity 核对真实祖先（避免 Windows 可区分大小写目录中的同名路径混淆）；每次选择时重新检查。macOS 比较区分大小写。
+
+**allowed_roots 是 Bridge 选择 cwd 的 targeting policy，不是 OS sandbox、ACL 或多租户隔离。** 它不撤销 native Codex 已有能力，不限制 thread visibility，也不能保证命令内部只访问这些目录。文件系统可在检查后变化；这不是持有文件句柄的强制访问控制。原生 sandbox/approval 与本机用户的权限仍是执行边界。

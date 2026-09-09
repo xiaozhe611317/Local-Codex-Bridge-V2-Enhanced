@@ -6,6 +6,7 @@ import {
   redactText,
   sanitizeForTransport,
   type RpcId,
+  type RuntimeSupervisionStatus,
 } from "./runtime.js";
 import { platformPolicyFor, type PlatformPolicy } from "./platform.js";
 import { VERSION } from "./version.js";
@@ -33,6 +34,8 @@ const MUTATING_REQUEST_METHODS = new Set([
 
 interface PendingCall {
   method: string;
+  threadId?: string;
+  turnId?: string;
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   timer: NodeJS.Timeout;
@@ -62,6 +65,22 @@ export interface AppServerLaunchOptions {
   requestTimeoutMs?: number;
   lateResponseTtlMs?: number;
   lateResponseLimit?: number;
+}
+
+export interface AppServerStatus {
+  source: "bridge_managed_app_server";
+  state: "not_started" | "starting" | "ready" | "unavailable" | "exited" | "restarting" | "closing" | "closed";
+  pid: number | null;
+  pid_status: "available" | "unavailable";
+  process_state: "not_running" | "exited" | "running" | "unknown";
+  initialized: boolean;
+  live: RuntimeSupervisionStatus;
+  operations_in_flight: number;
+  rpc_requests_in_flight: number;
+  writes_in_flight: number;
+  native_mutation_outcome_unknown: boolean;
+  safe_to_restart: boolean;
+  restart_denied_reasons: string[];
 }
 
 export interface ChildTerminationTimeouts {
@@ -355,6 +374,103 @@ export class AppServerManager {
   #initialized = false;
   #nextRequestId = 1;
   #stdoutBuffer = Buffer.alloc(0);
+  #operations = 0;
+  #writesInFlight = 0;
+  #uncertainMutation = false;
+  readonly #uncertainMutationIds = new Set<string>();
+  #uncertaintyOverflow = false;
+  #restarting = false;
+  #restartPromise: Promise<void> | null = null;
+  #retiringChild: ChildProcessWithoutNullStreams | null = null;
+
+  status(): AppServerStatus {
+    const live = this.runtime.supervisionStatus();
+    const child = this.#child;
+    const exited = child ? this.#platformPolicy.hasChildExited(child) : false;
+    const state = this.#closing ? (child ? "closing" : "closed")
+      : this.#restarting ? "restarting"
+      : exited ? "exited"
+      : this.#fatal ? "unavailable"
+      : this.#initialized ? "ready"
+      : this.#startPromise ? "starting" : "not_started";
+    const reasons: string[] = [];
+    if (this.#closing) reasons.push("manager_closing");
+    if (this.#restarting) reasons.push("restart_in_progress");
+    if (state === "starting") reasons.push("initialization_in_progress");
+    if (live.active_turns > 0) reasons.push("active_turns");
+    if (live.unscoped_active_threads > 0) reasons.push("unscoped_active_threads");
+    if (live.pending_requests > 0) reasons.push("pending_requests");
+    if (this.#operations > 0 || this.#pendingCalls.size > 0 || this.#writesInFlight > 0) reasons.push("native_operations_in_flight");
+    if (this.#uncertainMutation && child && !exited) reasons.push("native_mutation_outcome_unknown");
+    return {
+      source: "bridge_managed_app_server",
+      state,
+      pid: child && !exited ? child.pid ?? null : null,
+      pid_status: child && !exited && child.pid !== undefined ? "available" : "unavailable",
+      process_state: !child ? "not_running" : exited ? "exited" : child.pid ? "running" : "unknown",
+      initialized: this.#initialized && !exited && !this.#fatal && !this.#restarting,
+      live,
+      operations_in_flight: this.#operations,
+      rpc_requests_in_flight: this.#pendingCalls.size,
+      writes_in_flight: this.#writesInFlight,
+      native_mutation_outcome_unknown: this.#uncertainMutation && !!child && !exited,
+      safe_to_restart: reasons.length === 0,
+      restart_denied_reasons: reasons,
+    };
+  }
+
+  async withOperation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.#restarting || this.#closing) throw new Error("Codex app-server manager is restarting or closing");
+    this.#operations += 1;
+    try { return await operation(); }
+    finally { this.#operations -= 1; }
+  }
+
+  async restart(): Promise<void> {
+    const status = this.status();
+    if (!status.safe_to_restart) {
+      throw new Error("RESTART_DENIED: " + status.restart_denied_reasons.join(", "));
+    }
+    // Synchronous gate covers the complete terminate/handshake interval.
+    this.#restarting = true;
+    this.#restartPromise = this.#restart();
+    try { await this.#restartPromise; }
+    finally { this.#restarting = false; this.#restartPromise = null; }
+  }
+
+  async #restart(): Promise<void> {
+    const child = this.#child;
+    try {
+      if (child) {
+        this.#retiringChild = child;
+        await this.#terminateChild(child);
+        if (!this.#platformPolicy.hasChildExited(child)) throw new Error("Managed child exit is unverified");
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }
+      this.#child = null;
+      this.#childTerminationPromise = null;
+      this.#initialized = false;
+      this.#fatal = null;
+      this.#startPromise = null;
+      this.#stdoutBuffer = Buffer.alloc(0);
+      this.#lateResponses.clear();
+      this.#uncertainMutation = false;
+      this.#uncertainMutationIds.clear();
+      this.#uncertaintyOverflow = false;
+      this.runtime.resetAfterRestart();
+      if (this.#closing) throw new Error("Codex app-server manager is closing");
+      this.#startPromise = this.#start();
+      await this.#startPromise;
+    } catch (error) {
+      this.runtime.recordDiagnostic("restart_failure", { operation: "explicit_restart", status: "failed" });
+      this.#fatal ??= new Error("Explicit app-server restart failed");
+      throw error;
+    } finally {
+      this.#retiringChild = null;
+    }
+  }
 
   constructor(
     runtime = new RuntimeStore(),
@@ -394,16 +510,21 @@ export class AppServerManager {
   }
 
   async request(method: string, params: unknown): Promise<unknown> {
-    await this.ensureReady();
-    return await this.#request(method, params, this.#requestTimeoutMs);
+    return await this.withOperation(async () => {
+      await this.ensureReady();
+      return await this.#request(method, params, this.#requestTimeoutMs);
+    });
   }
 
   async respond(id: RpcId, result: unknown): Promise<void> {
-    await this.ensureReady();
-    await this.#write({ id, result });
+    await this.withOperation(async () => {
+      await this.ensureReady();
+      await this.#write({ id, result });
+    });
   }
 
   async ensureReady(): Promise<void> {
+    if (this.#restarting) throw new Error("Codex app-server manager is restarting");
     if (this.#closing) {
       throw new Error("Codex app-server manager is closing");
     }
@@ -451,7 +572,9 @@ export class AppServerManager {
     this.#child = child;
     child.stdin.on("error", (error) => this.#onStdinError(child, error));
     child.stdin.once("close", () => this.#onStdinClose(child));
-    child.stdout.on("data", (chunk: Buffer) => this.#onStdout(chunk));
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (child === this.#child && child !== this.#retiringChild) this.#onStdout(chunk);
+    });
     child.stderr.on("data", () => {
       // Drain without forwarding potentially sensitive child diagnostics.
     });
@@ -515,12 +638,24 @@ export class AppServerManager {
         if (!this.#pendingCalls.delete(key)) {
           return;
         }
+        if (MUTATING_REQUEST_METHODS.has(method)) {
+          this.#uncertainMutation = true;
+          if (this.#uncertainMutationIds.size < this.#lateResponseLimit) this.#uncertainMutationIds.add(key);
+          else this.#uncertaintyOverflow = true;
+          const scope = asRecord(params);
+          this.runtime.recordDiagnostic("mutation_outcome_unknown", { method, outcome: "UNKNOWN" },
+            boundedScopeId(scope?.threadId), boundedScopeId(scope?.turnId ?? scope?.expectedTurnId));
+        }
         if (lateCandidate) {
           this.#retainLateResponse(key, lateCandidate);
         }
         reject(requestTimeoutError(method));
       }, timeoutMs);
-      this.#pendingCalls.set(key, { method, resolve, reject, timer });
+      const requestScope = asRecord(params);
+      const threadId = boundedScopeId(requestScope?.threadId);
+      const turnId = boundedScopeId(requestScope?.turnId ?? requestScope?.expectedTurnId);
+      this.#pendingCalls.set(key, { method, resolve, reject, timer,
+        ...(threadId ? { threadId } : {}), ...(turnId ? { turnId } : {}) });
       void this.#write({ method, id, params }).catch((error: unknown) => {
         const pending = this.#pendingCalls.get(key);
         if (!pending) {
@@ -569,8 +704,10 @@ export class AppServerManager {
   #reconcileLateResponse(
     retained: RetainedLateResponse,
     response: Record<string, unknown>,
-  ): void {
+  ): boolean {
     if (response.error !== undefined && response.error !== null) {
+      const nativeError = asRecord(response.error);
+      if (typeof nativeError?.code !== "number" || typeof nativeError.message !== "string") return false;
       const candidate = retained.candidate;
       if (candidate.method !== "thread/start") {
         const turnId = candidate.method === "turn/steer" || candidate.method === "turn/interrupt"
@@ -584,11 +721,11 @@ export class AppServerManager {
           error: response.error,
         });
       }
-      return;
+      return true;
     }
     const result = asRecord(response.result);
     if (!result) {
-      return;
+      return false;
     }
     const candidate = retained.candidate;
     if (candidate.method === "thread/start" || candidate.method === "thread/resume") {
@@ -598,30 +735,31 @@ export class AppServerManager {
         (candidate.method === "thread/resume" &&
           threadId !== candidate.requestedThreadId)
       ) {
-        return;
+        return false;
       }
       this.runtime.reconcileLateMutationSuccess({
         method: candidate.method,
         threadId,
         timedOutAt: retained.timedOutAt,
       });
-      return;
+      return true;
     }
 
     if (candidate.method === "turn/steer" || candidate.method === "turn/interrupt") {
+      if (candidate.method === "turn/steer" && result.turnId !== candidate.requestedTurnId) return false;
       this.runtime.reconcileLateMutationSuccess({
         method: candidate.method,
         threadId: candidate.requestedThreadId,
         turnId: candidate.requestedTurnId,
         timedOutAt: retained.timedOutAt,
       });
-      return;
+      return true;
     }
 
     const turn = asRecord(result.turn);
     const turnId = boundedScopeId(turn?.id);
     if (!turnId) {
-      return;
+      return false;
     }
     const status = typeof turn?.status === "string" && turn.status.length > 0
       ? turn.status
@@ -633,11 +771,14 @@ export class AppServerManager {
       ...(status ? { status } : {}),
       timedOutAt: retained.timedOutAt,
     });
+    return true;
   }
 
   async #write(message: unknown): Promise<void> {
     const encoded = `${JSON.stringify(message)}\n`;
-    await this.#writeLine(encoded);
+    this.#writesInFlight += 1;
+    try { await this.#writeLine(encoded); }
+    finally { this.#writesInFlight -= 1; }
   }
 
   #onStdout(chunk: Buffer): void {
@@ -717,7 +858,11 @@ export class AppServerManager {
     if (!pending) {
       const retained = this.#takeLateResponse(rpcKey(id));
       if (retained) {
-        this.#reconcileLateResponse(retained, record);
+        const verified = this.#reconcileLateResponse(retained, record);
+        if (verified) {
+          this.#uncertainMutationIds.delete(rpcKey(id));
+          this.#uncertainMutation = this.#uncertaintyOverflow || this.#uncertainMutationIds.size > 0;
+        }
       }
       return;
     }
@@ -729,6 +874,7 @@ export class AppServerManager {
         typeof errorRecord?.message === "string"
           ? errorRecord.message
           : messageFromUnknown(record.error);
+      this.runtime.recordDiagnostic("native_rpc_error", { method: pending.method, error: record.error }, pending.threadId, pending.turnId);
       pending.reject(
         new Error(`Codex app-server ${pending.method} failed: ${redactText(detail)}`),
       );
@@ -741,6 +887,7 @@ export class AppServerManager {
     if (this.#fatal) {
       return;
     }
+    this.runtime.recordDiagnostic("protocol_error", { message });
     this.#fatal = new Error(redactText(message));
     this.runtime.markAppServerExited(this.#fatal.message);
     this.#rejectAll(this.#fatal);
@@ -753,16 +900,17 @@ export class AppServerManager {
   }
 
   #onChildError(child: ChildProcessWithoutNullStreams, error: Error): void {
-    if (child !== this.#child || this.#closing) {
+    if (child !== this.#child || child === this.#retiringChild || this.#closing) {
       return;
     }
+    this.runtime.recordDiagnostic("app_server_unexpected_exit", { process_error: error.message });
     this.#fatal = new Error(`Codex app-server process error: ${redactText(error.message)}`);
     this.runtime.markAppServerExited(this.#fatal.message);
     this.#rejectAll(this.#fatal);
   }
 
   #onStdinError(child: ChildProcessWithoutNullStreams, error: Error): void {
-    if (child !== this.#child || this.#closing || this.#fatal) {
+    if (child !== this.#child || child === this.#retiringChild || this.#closing || this.#fatal) {
       return;
     }
     this.#protocolFailure(
@@ -773,6 +921,7 @@ export class AppServerManager {
   #onStdinClose(child: ChildProcessWithoutNullStreams): void {
     if (
       child !== this.#child ||
+      child === this.#retiringChild ||
       this.#closing ||
       this.#fatal ||
       child.exitCode !== null ||
@@ -792,9 +941,10 @@ export class AppServerManager {
       return;
     }
     this.#initialized = false;
-    if (this.#closing) {
+    if (this.#closing || child === this.#retiringChild) {
       return;
     }
+    this.runtime.recordDiagnostic("app_server_unexpected_exit", { exit_code: code, signal });
     const failure = new Error(
       `Codex app-server exited unexpectedly (code=${String(code)}, signal=${String(signal)})`,
     );
@@ -824,6 +974,7 @@ export class AppServerManager {
 
   async #close(): Promise<void> {
     this.#closing = true;
+    await this.#restartPromise?.catch(() => undefined);
     const child = this.#child;
     if (!child) {
       return;

@@ -1,4 +1,11 @@
 import { isDeepStrictEqual } from "node:util";
+import { bridgeStatus } from "./bridge-status.js";
+import { contextVerification } from "./context-verification.js";
+import { supervisionObservation } from "./supervision.js";
+import { ObservationSession, type ControlCallContext } from "./observation-session.js";
+import { automaticObservation, type ObserveMode } from "./observation-transport.js";
+import { deltaSummary, requestReference } from "./observation-summary.js";
+import { TargetingPolicy } from "./targeting.js";
 import { AppServerManager } from "./app-server.js";
 import {
   CHECKPOINT_TEXT_LIMIT,
@@ -168,7 +175,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_turn",
     title: "Start or Continue Codex Turn",
     description:
-      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Explicit model or effort overrides are validated against a fresh model/list catalog without caching. Effort alone is checked only against efforts advertised somewhere in that catalog; the Bridge does not infer the current thread model, so app-server remains authoritative for current-model compatibility. Returns as soon as turn/start is accepted; observe separately for events and completion. If an already-sent mutating acknowledgement times out, the outcome is UNKNOWN and the request was possibly accepted; observe/read before any retry, and never directly retry it.",
+      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Explicit model or effort overrides are validated against a fresh model/list catalog without caching. Effort alone is checked only against efforts advertised somewhere in that catalog; the Bridge does not infer the current thread model, so app-server remains authoritative for current-model compatibility. Returns as soon as turn/start is accepted; ordinary supervision calls codex_observe with thread_id and optional wait_ms, omitting cursor. event_cursor remains an advanced manual cursor, not an automatic-session acknowledgement. Observe separately for events and completion. If an already-sent mutating acknowledgement times out, the outcome is UNKNOWN and the request was possibly accepted; observe/read before any retry, and never directly retry it.",
     inputSchema: {
       type: "object",
       properties: {
@@ -187,7 +194,11 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         cwd: {
           type: "string",
           maxLength: 1000,
-          description: "Absolute native cwd. Required for a new thread; optional override for resume.",
+          description: "Absolute native cwd. Required with no thread_id or project_alias; optional override for resume. Subject to configured Bridge targeting policy, which is not an OS sandbox.",
+        },
+        project_alias: {
+          type: "string", minLength: 1, maxLength: 100,
+          description: "Configured alias to absolute cwd only. Mutually exclusive with cwd; resolved targets still pass allowed_roots.",
         },
         model: {
           type: "string",
@@ -205,7 +216,8 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         approval_policy: approvalPolicySchema,
       },
       required: ["text"],
-      anyOf: [{ required: ["thread_id"] }, { required: ["cwd"] }],
+      anyOf: [{ required: ["thread_id"] }, { required: ["cwd"] }, { required: ["project_alias"] }],
+      not: { required: ["cwd", "project_alias"] },
       additionalProperties: false,
     },
     annotations: {
@@ -220,7 +232,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_observe",
     title: "Observe Codex Turn",
     description:
-      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Optional wait_ms performs one bounded event-driven wait only when the live turn is active and the current snapshot has nothing useful; it is not polling or stall detection. After Bridge process loss, falls back to persistent thread/read history and marks live state unreconstructable. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
+      "GPT is the supervisor; Bridge provides transport, control, and evidence; native Codex executes. Default auto consumes only the delivered delta using a bounded per-connection/thread cursor, suppresses agent/token noise, and adds only related bounded raw evidence on anomalies; it never replays whole history. Explicit supervision forces low noise and raw is for debugging/evidence. An explicit cursor selects independent manual compatibility semantics. Fixed delta_summary fields are changes/commands/validation/pending/unresolved/next; command exit evidence is not an acceptance judgment. Cursor loss, restart, or unavailable live state requires supervisor re-anchoring from checkpoint if used and native thread evidence. Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Optional wait_ms performs one bounded event-driven wait only when the live turn is active and the current snapshot has nothing useful; it is not polling or stall detection. After Bridge process loss, auto returns unreconstructable live state and requires re-anchoring without replay; only explicit manual cursor reads retain degraded persistent thread/read fallback. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
     inputSchema: {
       type: "object",
       properties: {
@@ -228,7 +240,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         cursor: {
           type: "integer",
           minimum: 0,
-          description: "Return runtime events with a cursor greater than this value.",
+          description: "Advanced manual/debug cursor: return events after this value without reading or advancing the connection automatic cursor. Omit for automatic incremental delivery.",
         },
         limit: {
           type: "integer",
@@ -236,6 +248,10 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           maximum: 100,
           default: 50,
           description: "Maximum runtime events to return.",
+        },
+        mode: {
+          type: "string", enum: ["auto", "supervision", "raw"], default: "auto",
+          description: "auto (default) uses delivered per-connection/thread cursors and low-noise deltas, adding bounded related diagnostic evidence on anomalies. supervision disables automatic raw expansion; raw explicitly exposes raw events. With an explicit cursor, omitted/auto mode uses manual raw compatibility; manual reads never change automatic cursors.",
         },
         wait_ms: {
           type: "integer",
@@ -380,10 +396,29 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     },
   },
   {
+    name: "bridge_status",
+    title: "Bridge Status",
+    description: "Read this running Bridge's embedded version/build identity, PID, uptime, and bounded authoritative live counts. Never starts app-server or reads environment/configuration contents.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    annotations: { title: "Bridge Status", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "codex_runtime",
+    title: "Codex Runtime",
+    description: "Read managed app-server status, or explicitly restart only that child and repeat initialization. Restart fails closed with RESTART_DENIED while any turn, request, operation, or uncertain mutation can be active. Does not restart Bridge or Tunnel; no automatic retry or restart loop.",
+    inputSchema: {
+      type: "object",
+      properties: { action: { type: "string", enum: ["status", "restart"] } },
+      required: ["action"],
+      additionalProperties: false,
+    },
+    annotations: { title: "Codex Runtime", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  {
     name: "codex_checkpoint",
     title: "Checkpoint Codex Supervision",
     description:
-      "Optional, bounded supervisor cognition memory keyed to one native Codex thread_id; the key is not a permanent task identity and does not require future work to remain on that thread. Use it to protect the original goal, constraints, and acceptance plus concise supervisor state during long or complex supervision when context dilution or goal drift makes an external anchor worthwhile. Initialization is not tied to crossing a ChatGPT window or round, starting another Codex turn, or switching native threads; initialize early when a task is already expected to be sufficiently long or complex for that protection. Do not use for one-shot work, and do not turn duration into a hard threshold: elapsed time, observe/poll count, token count, or mere silence are not automatic triggers. Later updates remain semantic-event driven and require a material change in understanding or root cause, constraint or scope interpretation, steering decision, user-authorized amendment or effective goal, or acceptance judgment or an explicit decision not to accept yet. Before final acceptance of a checkpointed task, read it once to re-anchor the original goal, constraints, acceptance, and current supervisor frame. This tool is optional and uncoupled from all other tools. Store concise supervisor summaries only; never prompts, transcripts, raw events, command output, final answers, or raw event streams. Updates preserve only immutable original plus bounded previous/current supervisor state.",
+      "Optional, bounded supervisor cognition memory keyed to one native Codex thread_id; the key is not a permanent task identity and does not require future work to remain on that thread. Use it to protect the original goal, constraints, and acceptance plus concise supervisor state during long or complex supervision when context dilution or goal drift makes an external anchor worthwhile. Initialization is not tied to crossing a ChatGPT window or round, starting another Codex turn, or switching native threads; initialize early when a task is already expected to be sufficiently long or complex for that protection. Do not use for one-shot work, and do not turn duration into a hard threshold: elapsed time, observe/poll count, token count, or mere silence are not automatic triggers. Later updates remain semantic-event driven and require a material change in understanding or root cause, constraint or scope interpretation, steering decision, user-authorized amendment or effective goal, or acceptance judgment or an explicit decision not to accept yet. Before final acceptance of a checkpointed task, read it once to re-anchor the original goal, constraints, acceptance, and current supervisor frame. This tool is optional and uncoupled from all other tools. Store concise supervisor summaries of goal, hard constraints, current state, validation evidence and unresolved questions only; never prompts, transcripts, raw events, command output, final answers, or raw event streams. Updates preserve only immutable original plus bounded previous/current supervisor state.",
     inputSchema: {
       type: "object",
       properties: {
@@ -734,11 +769,13 @@ function throwIfAborted(signal?: AbortSignal): void {
 
 export class ControlSurface {
   private checkpoints: CheckpointStore | undefined;
+  private readonly observationSession = new ObservationSession();
 
   constructor(
     private readonly appServer: AppServerManager,
     checkpoints?: CheckpointStore,
     private readonly platformPolicy: PlatformPolicy = platformPolicyFor(),
+    private readonly targeting: TargetingPolicy = new TargetingPolicy({}, platformPolicy),
   ) {
     this.checkpoints = checkpoints;
   }
@@ -748,17 +785,22 @@ export class ControlSurface {
     return input ? this.platformPolicy.validateCwd(input) : undefined;
   }
 
-  async call(name: string, rawArguments: unknown, signal?: AbortSignal): Promise<unknown> {
+  async call(name: string, rawArguments: unknown, signal?: AbortSignal, context?: ControlCallContext): Promise<unknown> {
     const args = asObject(rawArguments ?? {});
     switch (name) {
       case "codex_threads":
         return await this.#threads(args);
       case "codex_models":
         return await this.#models(args);
+      case "bridge_status":
+        onlyKeys(args, []);
+        return bridgeStatus(this.appServer);
+      case "codex_runtime":
+        return await this.#runtime(args);
       case "codex_turn":
-        return await this.#turn(args);
+        return await this.appServer.withOperation(() => this.#turn(args));
       case "codex_observe":
-        return await this.#observe(args, signal);
+        return await this.#observe(args, signal, context);
       case "codex_steer":
         return await this.#steer(args);
       case "codex_respond":
@@ -770,6 +812,32 @@ export class ControlSurface {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
+  }
+
+  async #runtime(args: Record<string, unknown>): Promise<unknown> {
+    onlyKeys(args, ["action"]);
+    const action = enumValue(args, "action", ["status", "restart"] as const);
+    if (!action) throw new Error("action is required");
+    if (action === "status") return this.appServer.status();
+    await this.appServer.restart();
+    return { restarted: true, ...this.appServer.status() };
+  }
+
+  async #inheritedCwd(threadId: string): Promise<string> {
+    const result = await this.appServer.request("thread/read", { threadId, includeTurns: false });
+    const thread = asObject(asObject(result, "thread/read response").thread, "thread/read thread");
+    if (thread.id !== threadId) throw new Error("TARGETING_DENIED: thread/read scope mismatch");
+    if (typeof thread.cwd !== "string") throw new Error("TARGETING_DENIED: native inherited cwd unavailable");
+    return this.targeting.check(thread.cwd);
+  }
+
+  #checkNativeTarget(result: unknown, expected: string): void {
+    const native = asObject(result, "native thread result");
+    // Top-level cwd is the effective settings readback. Persisted thread.cwd is
+    // insufficient to verify a loaded thread's current settings.
+    if (typeof native.cwd !== "string") throw new Error("TARGETING_DENIED: native effective cwd unavailable");
+    const effective = this.targeting.check(native.cwd);
+    if (!this.targeting.samePath(effective, expected)) throw new Error("TARGETING_DENIED: native effective cwd differs from selected target");
   }
 
   #checkpoint(args: Record<string, unknown>): unknown {
@@ -1005,10 +1073,14 @@ export class ControlSurface {
   }
 
   async #turn(args: Record<string, unknown>): Promise<unknown> {
-    onlyKeys(args, ["text", "thread_id", "cwd", "model", "effort", "sandbox", "approval_policy"]);
+    onlyKeys(args, ["text", "thread_id", "cwd", "project_alias", "model", "effort", "sandbox", "approval_policy"]);
     const text = requiredString(args, "text");
     const requestedThreadId = optionalString(args, "thread_id", 200);
-    const cwd = this.#cwd(args);
+    const requestedCwd = optionalString(args, "cwd", 1_000);
+    const projectAlias = optionalString(args, "project_alias", 100);
+    const cwd = this.targeting.resolve(requestedCwd, projectAlias);
+    const selectedCwd = cwd ?? (this.targeting.restricted && requestedThreadId
+      ? await this.#inheritedCwd(requestedThreadId) : undefined);
     if (!requestedThreadId && !cwd) {
       throw new Error(
         `cwd is required when thread_id is omitted and must be an ${this.platformPolicy.nativeCwdDescription}`,
@@ -1019,6 +1091,7 @@ export class ControlSurface {
     const sandbox = enumValue(args, "sandbox", ["read-only", "workspace-write", "danger-full-access"] as const);
     const approvalPolicy = enumValue(args, "approval_policy", ["untrusted", "on-request", "never"] as const);
     await this.#validateExecutionOverrides(model, effort);
+    if (selectedCwd && this.targeting.restricted) this.targeting.check(selectedCwd);
     const overrides = {
       ...(cwd ? { cwd } : {}),
       ...(model ? { model } : {}),
@@ -1040,6 +1113,7 @@ export class ControlSurface {
     if (requestedThreadId && threadId !== requestedThreadId) {
       throw new Error("thread/resume returned a different thread id");
     }
+    if (this.targeting.restricted) this.#checkNativeTarget(threadResult, selectedCwd!);
     // Codex 0.153.4 ignores resume sandbox overrides for an already-loaded
     // thread. Use its explicit settings API only for the bounded safe modes,
     // then wait for native application evidence before retaining the original
@@ -1076,7 +1150,7 @@ export class ControlSurface {
       const applied = asObject(settings.sandboxPolicy, "native sandbox policy");
       if (applied.type !== policy.type || applied.networkAccess !== false) throw new Error("Native sandbox update was not verified");
       if (sandbox === "workspace-write" && (applied.excludeTmpdirEnvVar !== true || applied.excludeSlashTmp !== true ||
-          !Array.isArray(applied.writableRoots) || applied.writableRoots.some(r => typeof r !== "string" || !sameCwd(r, cwd)))) {
+          !Array.isArray(applied.writableRoots) || applied.writableRoots.some(r => typeof r !== "string" || !sameCwd(r, cwd!)))) {
         throw new Error("Native writable scope exceeds the requested workspace");
       }
       threadResult = await this.appServer.request("thread/resume", { threadId });
@@ -1086,6 +1160,10 @@ export class ControlSurface {
           confirmed.approvalsReviewer !== "user" || confirmed.approvalPolicy !== "on-request") {
         throw new Error("Native settings changed before turn/start; no turn started");
       }
+    }
+    if (this.targeting.restricted) {
+      this.#checkNativeTarget(threadResult, selectedCwd!);
+      this.targeting.check(selectedCwd!);
     }
     const sandboxPolicy = sandbox
       ? extractSandboxPolicy(threadResult, threadMethod, sandbox)
@@ -1112,22 +1190,39 @@ export class ControlSurface {
       turn_id: turnId,
       event_cursor: this.appServer.runtime.currentCursor(threadId),
       status: typeof turn.status === "string" ? turn.status : "inProgress",
+      context_verification: contextVerification({
+        cwd: requestedCwd ?? null,
+        project_alias: projectAlias ?? null,
+        selected_cwd: selectedCwd ?? null,
+        sandbox: sandbox ?? null,
+        approval_policy: approvalPolicy ?? null,
+        model: model ?? null,
+        effort: effort ?? null,
+      }, threadResult, threadMethod, this.platformPolicy),
     };
   }
 
-  async #observe(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+  async #observe(args: Record<string, unknown>, signal?: AbortSignal, context?: ControlCallContext): Promise<unknown> {
     throwIfAborted(signal);
-    onlyKeys(args, ["thread_id", "cursor", "limit", "wait_ms"]);
+    onlyKeys(args, ["thread_id", "cursor", "limit", "wait_ms", "mode"]);
     const threadId = requiredString(args, "thread_id", 200);
     const cursor = optionalInteger(args, "cursor", 0, Number.MAX_SAFE_INTEGER);
     const limit = optionalInteger(args, "limit", 1, 100) ?? 50;
     const waitMs = optionalInteger(args, "wait_ms", 0, MAX_OBSERVE_WAIT_MS) ?? 0;
+    const requestedMode = enumValue(args, "mode", ["auto", "supervision", "raw"] as const) ?? "auto";
+    if (cursor === undefined) return await this.#automaticObserve(threadId, limit, waitMs, requestedMode, signal, context);
+    const mode = requestedMode === "auto" ? "raw" : requestedMode;
     const runtime = waitMs === 0
       ? this.appServer.runtime.observe(threadId, cursor, limit)
       : await this.appServer.runtime.observeWithWait(threadId, cursor, limit, waitMs, signal);
     throwIfAborted(signal);
     if (runtime) {
-      return runtime;
+      return {
+        ...(mode === "supervision" ? supervisionObservation(runtime) : runtime),
+        mode, effective_mode: mode, cursor_control: "manual",
+        delta_summary: deltaSummary(runtime.events, runtime.pending_requests.map(request => ({ ...requestReference(request), status: "pending" })), [], []),
+        reanchor: { required: runtime.cursor_lost, reasons: runtime.cursor_lost ? ["cursor_lost"] : [] },
+      };
     }
     throwIfAborted(signal);
     const result = await this.appServer.request("thread/read", {
@@ -1136,6 +1231,13 @@ export class ControlSurface {
     });
     throwIfAborted(signal);
     return sanitizeForTransport({
+      ...(mode === "supervision" ? {
+        mode,
+        suppressed_events: { count: 0, by_method: {}, scope: "consumed_page" },
+      } : {}),
+      mode, effective_mode: mode, cursor_control: "manual",
+      delta_summary: deltaSummary([], [], [{ code: "live_unreconstructable" }], [{ action: "re_anchor" }]),
+      reanchor: { required: true, reasons: ["live_unreconstructable"] },
       runtime_available: false,
       live_state_reconstructable: false,
       note: "This Bridge process has no in-memory runtime for the thread. Live event ring and pending requests cannot be reconstructed after process loss.",
@@ -1152,6 +1254,41 @@ export class ControlSurface {
       stored_thread: responseRecord(result, "thread/read").thread,
       source: "codex_app_server_thread_read",
     });
+  }
+
+  async #automaticObserve(
+    threadId: string, limit: number, waitMs: number, mode: ObserveMode,
+    signal?: AbortSignal, context?: ControlCallContext,
+  ): Promise<unknown> {
+    const runtime = this.appServer.runtime;
+    const session = context?.observationSession ?? this.observationSession;
+    const lease = session.acquire(threadId, runtime.supervisionStatus().generation);
+    try {
+      const hasDiagnostic = runtime.diagnosticsAfter(threadId, lease.state.diagnosticCursor).length > 0 ||
+        session.diagnosticsAfter(lease.state.connectionDiagnosticCursor).length > 0;
+      const snapshot = waitMs === 0 || hasDiagnostic
+        ? runtime.observe(threadId, lease.state.cursor, limit)
+        : await runtime.observeWithWait(threadId, lease.state.cursor, limit, waitMs, signal);
+      throwIfAborted(signal);
+      const generation = runtime.supervisionStatus().generation;
+      const prepared = automaticObservation({
+        snapshot, previous: lease.state, mode, generation,
+        generationChanged: lease.generationChanged || generation !== lease.state.generation,
+        cursorUnavailable: lease.cursorUnavailable,
+        runtimeDiagnostics: runtime.diagnosticsAfter(threadId, lease.state.diagnosticCursor),
+        connectionDiagnostics: session.diagnosticsAfter(lease.state.connectionDiagnosticCursor),
+        recentEvents: runtime.recentEvents(threadId),
+        supportedRequests: SUPPORTED_RESPOND_METHODS,
+        ...(typeof this.appServer.status === "function" ? { appServerStatus: this.appServer.status() } : {}),
+      });
+      const delivery = { commit: () => lease.commit(prepared.state), rollback: lease.release };
+      if (context?.deferObservation) context.deferObservation(delivery);
+      else delivery.commit();
+      return prepared.result;
+    } catch (error) {
+      lease.release();
+      throw error;
+    }
   }
 
   async #steer(args: Record<string, unknown>): Promise<unknown> {

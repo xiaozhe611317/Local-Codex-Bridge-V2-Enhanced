@@ -4,6 +4,8 @@
 
 Local Codex Bridge is a thin MCP stdio control surface for native Codex sessions, with a shared Windows/macOS core and optional platform-specific surfaces. Its purpose is to let ChatGPT or another MCP client supervise official Codex threads without creating a second task system, transcript store, queue, retry loop, or authority layer.
 
+GPT is the supervisor; Bridge provides transport/control/evidence; native Codex is the executor. Automatic observation cursors are bounded connection-local delivery metadata; commit them only after successful delivery and never reconstruct them from guesses.
+
 Keep the bridge thin. Native Codex owns persistent threads, turns, history, final messages, and execution capabilities. Bridge-owned state is limited to bounded live supervision data, pending requests, terminal snapshots, optional bounded checkpoints, and the optional UX projection.
 
 ## Architecture
@@ -18,15 +20,17 @@ MCP client -> Local Codex Bridge (JSON-RPC stdio)
 
 `src/mcp.ts` owns the MCP boundary, `src/app-server.ts` owns the official child-process protocol, `src/tools.ts` owns the public tool contract, and `src/runtime.ts` owns ephemeral live state. `src/checkpoint.ts` provides the separate optional local checkpoint store. The Windows Tray and Secure MCP Tunnel integration are optional layers; the Tunnel itself is external to this repository.
 
-The eight public tools have distinct semantics:
+The ten public tools have distinct semantics:
 
 - `codex_threads`: list/search/read persistent native threads; filters are not access control.
 - `codex_models`: read one bounded current `model/list` page on demand; it creates no catalog cache or current-model registry.
 - `codex_turn`: create or resume a native thread and start a turn; acceptance is not completion.
-- `codex_observe`: read bounded live state or explicitly degraded persisted history after Bridge state loss.
+- `codex_observe`: default auto delivers bounded per-connection/thread deltas and related anomaly evidence; explicit manual cursors retain raw/history compatibility. Re-anchor after state loss.
 - `codex_steer`: append a semantic correction to the exact active turn; do not use it as a timer or retry.
 - `codex_respond`: answer one real pending app-server request using its raw ID and exact scope.
 - `codex_interrupt`: interrupt one exact native turn; it is not process control.
+- `bridge_status`: read running Bridge identity and authoritative managed runtime counts.
+- `codex_runtime`: status or explicitly guarded managed app-server restart; never restart Bridge/Tunnel or auto-retry.
 - `codex_checkpoint`: maintain optional bounded supervisor cognition metadata; it is not a transcript or lifecycle database.
 
 Preserve these distinctions, the tool names, validation, annotations, and stdout protocol purity unless a requested contract change explicitly requires otherwise.
@@ -56,7 +60,7 @@ Prefer evidence from the current source, tests, package metadata, and actual mac
 A rebuild or install should demonstrate, as applicable:
 
 - dependency installation, type checking, build, and the regular automated test suite succeed;
-- the MCP server keeps stdout clean, initializes correctly, and exposes exactly the eight intended tools;
+- the MCP server keeps stdout clean, initializes correctly, and exposes exactly the ten intended tools;
 - the official app-server executable is resolved and launched with the expected stdio arguments;
 - persistent native history and ephemeral Bridge state remain clearly separated;
 - no author-specific path, credential, Tunnel profile, port, or secret has entered the repository or generic setup;

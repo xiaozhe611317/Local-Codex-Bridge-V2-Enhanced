@@ -1,6 +1,7 @@
 import { sanitizeForTransport, type RpcId } from "./runtime.js";
 import { ControlSurface, TOOL_DEFINITIONS, TOOL_NAMES } from "./tools.js";
 import { VERSION } from "./version.js";
+import { ObservationSession, type ObservationDelivery } from "./observation-session.js";
 
 const JSONRPC_VERSION = "2.0";
 const LATEST_PROTOCOL_VERSION = "2025-11-25";
@@ -110,6 +111,7 @@ export interface McpStdioServerOptions {
 
 export class McpStdioServer {
   readonly #cancelled = new Set<string>();
+  readonly #observationSession = new ObservationSession();
   readonly #activeRequests = new Set<string>();
   readonly #requestControllers = new Map<string, AbortController>();
   readonly #control: ControlSurface;
@@ -139,6 +141,7 @@ export class McpStdioServer {
       return;
     }
     this.#closing = true;
+    this.#observationSession.clear();
     this.#abortActiveRequests();
     process.stdin.off("data", this.#onData);
     process.stdin.off("end", this.#onInputClose);
@@ -327,13 +330,18 @@ export class McpStdioServer {
       return;
     }
 
+    let delivery: ObservationDelivery | undefined;
     try {
       const result = await this.#control.call(
         name,
         toolArguments,
         name === "codex_observe" ? signal : undefined,
+        {
+          observationSession: this.#observationSession,
+          deferObservation: prepared => { delivery = prepared; },
+        },
       );
-      await this.#sendResult(id, {
+      const delivered = await this.#sendResult(id, {
         content: [
           {
             type: "text",
@@ -341,6 +349,7 @@ export class McpStdioServer {
           },
         ],
       });
+      if (delivered && !signal.aborted) delivery?.commit();
     } catch (error) {
       await this.#sendResult(id, {
         content: [
@@ -351,17 +360,21 @@ export class McpStdioServer {
         ],
         isError: true,
       });
+    } finally {
+      delivery?.rollback();
     }
   }
 
-  async #sendResult(id: RpcId, result: unknown): Promise<void> {
+  async #sendResult(id: RpcId, result: unknown): Promise<boolean> {
     if (this.#cancelled.delete(idKey(id))) {
-      return;
+      return false;
     }
     await this.#write({ jsonrpc: JSONRPC_VERSION, id, result });
+    return true;
   }
 
   async #sendError(id: RpcId | undefined, error: RpcError): Promise<void> {
+    this.#observationSession.recordProtocolError(error.code, error.message);
     if (id !== undefined && this.#cancelled.delete(idKey(id))) {
       return;
     }
@@ -373,6 +386,7 @@ export class McpStdioServer {
   }
 
   async #sendProtocolError(id: RpcId, error: RpcError): Promise<void> {
+    this.#observationSession.recordProtocolError(error.code, error.message);
     await this.#write({ jsonrpc: JSONRPC_VERSION, id, error });
   }
 

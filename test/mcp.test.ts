@@ -22,8 +22,10 @@ class TestClient {
   readonly #unclaimed: Record<string, unknown>[] = [];
   #buffer = "";
 
-  constructor(environment: NodeJS.ProcessEnv = process.env) {
-    const entry = fileURLToPath(new URL("../src/index.js", import.meta.url));
+  constructor(
+    environment: NodeJS.ProcessEnv = process.env,
+    entry = fileURLToPath(new URL("../src/index.js", import.meta.url)),
+  ) {
     this.child = spawn(process.execPath, [entry], {
       env: environment,
       stdio: ["pipe", "pipe", "pipe"],
@@ -118,7 +120,7 @@ async function initialize(client: TestClient, id: RpcId): Promise<void> {
   assert.equal(response.error, undefined);
 }
 
-test("MCP stdio initializes idempotently and lists exactly eight fully annotated tools", async () => {
+test("MCP stdio initializes idempotently and lists exactly ten fully annotated tools", async () => {
   const client = new TestClient();
   try {
     const initializeLine = JSON.stringify({
@@ -196,6 +198,8 @@ test("MCP stdio initializes idempotently and lists exactly eight fully annotated
       "codex_steer",
       "codex_respond",
       "codex_interrupt",
+      "bridge_status",
+      "codex_runtime",
       "codex_checkpoint",
     ]);
     for (const tool of tools) {
@@ -207,6 +211,18 @@ test("MCP stdio initializes idempotently and lists exactly eight fully annotated
         assert.equal(typeof annotations[hint], "boolean", `${String(tool.name)} ${hint}`);
       }
     }
+    const status = successfulToolPayload(await client.request(40, "tools/call", { name: "bridge_status", arguments: {} }));
+    assert.equal((status.bridge as Record<string, unknown>).pid, client.child.pid);
+    assert.equal((status.app_server as Record<string, unknown>).state, "not_started");
+    const runtimeStatus = successfulToolPayload(await client.request(41, "tools/call", { name: "codex_runtime", arguments: { action: "status" } }));
+    assert.equal(runtimeStatus.pid, null);
+    assert.equal(runtimeStatus.safe_to_restart, true);
+    const runtimeTool = tools.find(tool => tool.name === "codex_runtime")!;
+    assert.equal((runtimeTool.annotations as Record<string, unknown>).readOnlyHint, false);
+    const observeTool = tools.find(tool => tool.name === "codex_observe")!;
+    const observeProperties = (observeTool.inputSchema as Record<string, unknown>).properties as Record<string, unknown>;
+    assert.deepEqual((observeProperties.mode as Record<string, unknown>).enum, ["auto", "supervision", "raw"]);
+    assert.equal((observeProperties.mode as Record<string, unknown>).default, "auto");
     const modelsTool = tools.find((tool) => tool.name === "codex_models");
     assert.match(modelsTool?.description as string, /model\/list/);
     const modelProperties = (modelsTool?.inputSchema as Record<string, unknown>)
@@ -624,4 +640,48 @@ test("MCP reports protocol errors and domain tool errors without stdout noise", 
   } finally {
     assert.equal(await client.close(), 0);
   }
+});
+
+test("MCP auto delivery is incremental, manual reads are independent, and protocol diagnostics recover", async () => {
+  const fixture = fileURLToPath(new URL("../../test/auto-mcp-fixture.mjs", import.meta.url));
+  const client = new TestClient(process.env, fixture);
+  try {
+    await initialize(client, 1);
+    const observe = async (id: number, args: Record<string, unknown> = {}) => successfulToolPayload(
+      await client.request(id, "tools/call", { name: "codex_observe", arguments: { thread_id: "transport-thread", ...args } }),
+    );
+    const first = await observe(2);
+    assert.equal(first.mode, "auto");
+    assert.equal(first.effective_mode, "supervision");
+    assert.equal((first.events as unknown[]).length, 1);
+    assert.equal((first.suppressed_events as Record<string, unknown>).count, 1);
+    assert.deepEqual((await observe(3)).events, []);
+    const manual = await observe(4, { cursor: 0 });
+    assert.equal(manual.cursor_control, "manual");
+    assert.equal((manual.events as unknown[]).length, 2);
+    assert.deepEqual((await observe(5)).events, []);
+
+    const invalid = await client.request(6, "unknown/method");
+    assert.equal((invalid.error as Record<string, unknown>).code, -32601);
+    const diagnostic = await observe(7);
+    assert.equal(diagnostic.effective_mode, "diagnostic");
+    assert.equal(((diagnostic.diagnostics as Record<string, unknown>).connection_evidence as unknown[]).length, 1);
+    assert.deepEqual((diagnostic.diagnostics as Record<string, unknown>).raw_evidence, []);
+    assert.equal((await observe(8)).effective_mode, "supervision");
+
+    client.writeRaw(JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call",
+      params: { name: "codex_observe", arguments: { thread_id: "transport-thread", wait_ms: 1000 } } }) + "\n");
+    await new Promise(resolve => setTimeout(resolve, 20));
+    client.writeRaw(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 9 } }) + "\n");
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const steered = successfulToolPayload(await client.request(10, "tools/call", { name: "codex_steer", arguments: {
+      thread_id: "transport-thread", expected_turn_id: "transport-turn", text: "new fixture output",
+    } }));
+    assert.equal(steered.accepted, true);
+    const resumed = await observe(11, { wait_ms: 1000 });
+    assert.equal((resumed.events as unknown[]).length, 1);
+    assert.equal((resumed.events as Array<Record<string, unknown>>)[0]?.method, "item/commandExecution/outputDelta");
+    assert.deepEqual((await observe(12)).events, []);
+    assert.equal(client.takeUnclaimed().some(message => message.id === 9), false);
+  } finally { assert.equal(await client.close(), 0); }
 });

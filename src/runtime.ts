@@ -88,6 +88,25 @@ interface ThreadRuntime {
   agentText: string;
 }
 
+export interface RuntimeDiagnostic {
+  sequence: number;
+  source: "bridge_runtime";
+  code: string;
+  at: string;
+  thread_id?: string;
+  turn_id?: string;
+  data: unknown;
+}
+
+export interface RuntimeSupervisionStatus {
+  generation: number;
+  loaded_threads: number;
+  active_turns: number;
+  unscoped_active_threads: number;
+  pending_requests: number;
+  responding_requests: number;
+}
+
 export interface RuntimeObservation {
   runtime_available: true;
   runtime_status: string;
@@ -361,6 +380,63 @@ export class RuntimeStore {
   readonly #turnToThread = new Map<string, string>();
   readonly #changeWaiters = new Map<string, Set<() => void>>();
 
+  readonly #diagnostics: RuntimeDiagnostic[] = [];
+  #diagnosticSequence = 0;
+
+  recordDiagnostic(code: string, data: unknown, threadId?: string, turnId?: string): void {
+    this.#diagnosticSequence += 1;
+    this.#diagnostics.push({
+      sequence: this.#diagnosticSequence, source: "bridge_runtime", code, at: new Date().toISOString(),
+      ...(threadId ? { thread_id: threadId } : {}), ...(turnId ? { turn_id: turnId } : {}),
+      data: sanitizeForTransport(data, { maxStringChars: 800, totalCharBudget: 1600, maxDepth: 5 }),
+    });
+    if (this.#diagnostics.length > 32) this.#diagnostics.shift();
+    for (const thread of this.#threads.values()) {
+      if (!threadId || thread.threadId === threadId) this.#signalChange(thread);
+    }
+  }
+
+  diagnosticsAfter(threadId: string, cursor: number): RuntimeDiagnostic[] {
+    return this.#diagnostics.filter(item => item.sequence > cursor && (!item.thread_id || item.thread_id === threadId));
+  }
+
+  recentEvents(threadId: string): RuntimeEvent[] {
+    return this.#threads.get(threadId)?.events.slice(-32) ?? [];
+  }
+
+  #generation = 0;
+  #cursorBase = 0;
+
+  supervisionStatus(): RuntimeSupervisionStatus {
+    let active = 0;
+    let unscopedActive = 0;
+    for (const thread of this.#threads.values()) {
+      if (thread.activeTurnId) active += 1;
+      else if (["active", "inProgress"].includes(thread.status)) unscopedActive += 1;
+    }
+    return {
+      generation: this.#generation,
+      loaded_threads: this.#threads.size,
+      active_turns: active,
+      unscoped_active_threads: unscopedActive,
+      pending_requests: this.#pending.size,
+      responding_requests: this.#responding.size,
+    };
+  }
+
+  resetAfterRestart(): void {
+    for (const thread of this.#threads.values()) {
+      this.#cursorBase = Math.max(this.#cursorBase, thread.nextCursor);
+      this.#signalChange(thread);
+    }
+    this.#threads.clear();
+    this.#pending.clear();
+    this.#responding.clear();
+    this.#turnToThread.clear();
+    this.#generation += 1;
+    this.#publishUx();
+  }
+
   constructor(
     private readonly ringLimit = 256,
     private readonly uxProjection?: UxProjectionSink,
@@ -386,7 +462,7 @@ export class RuntimeStore {
         activeTurnId: null,
         status: "idle",
         revision: 0,
-        nextCursor: 1,
+        nextCursor: this.#cursorBase + 1,
         events: [],
         terminal: null,
         agentText: "",
@@ -570,6 +646,17 @@ export class RuntimeStore {
       const turn = asRecord(asRecord(params)?.turn);
       const terminalTurnId = stringField(turn, "id") ?? turnId ?? runtime.activeTurnId;
       if (terminalTurnId) {
+        if (runtime.activeTurnId && runtime.activeTurnId !== terminalTurnId) {
+          this.recordDiagnostic("turn_terminal_conflict", {
+            expected_active_turn_id: runtime.activeTurnId, terminal_turn_id: terminalTurnId,
+          }, threadId, terminalTurnId);
+          // Completion of another turn cannot end the known active turn.
+          // Preserve the original event as evidence, without inventing a terminal for this turn.
+          this.clearPendingForThread(threadId, terminalTurnId);
+          this.#turnToThread.delete(terminalTurnId);
+          this.#appendEvent(runtime, method, params, terminalTurnId);
+          return;
+        }
         const status = stringField(turn, "status") ?? "unknown";
         const error = turn?.error ?? null;
         const final = extractFinalFromTurn(params) ?? (runtime.agentText || null);
@@ -694,6 +781,7 @@ export class RuntimeStore {
   markAppServerExited(message: string): void {
     const at = new Date().toISOString();
     for (const runtime of this.#threads.values()) {
+      if (!runtime.activeTurnId && ["active", "inProgress"].includes(runtime.status)) runtime.status = "appServerExited";
       if (runtime.activeTurnId) {
         const turnId = runtime.activeTurnId;
         runtime.status = "appServerExited";

@@ -36,6 +36,8 @@ test("checkpoint remains the final tool in the current tool catalog", () => {
     "codex_steer",
     "codex_respond",
     "codex_interrupt",
+    "bridge_status",
+    "codex_runtime",
     "codex_checkpoint",
   ]);
   const turn = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_turn");

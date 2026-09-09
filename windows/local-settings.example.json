@@ -3,5 +3,13 @@
   "tunnelProfile": "your-tunnel-profile",
   "tunnelExecutable": "%LOCALAPPDATA%\\Tools\\tunnel-client.exe",
   "projectionPath": "%LOCALAPPDATA%\\LocalCodexBridge\\ux-projection.json",
-  "checkpointDirectory": "%LOCALAPPDATA%\\LocalCodexBridge\\checkpoints"
+  "checkpointDirectory": "%LOCALAPPDATA%\\LocalCodexBridge\\checkpoints",
+  "targeting": {
+    "allowed_roots": [
+      "C:\\Projects"
+    ],
+    "project_aliases": {
+      "demo": "C:\\Projects\\Demo"
+    }
+  }
 }

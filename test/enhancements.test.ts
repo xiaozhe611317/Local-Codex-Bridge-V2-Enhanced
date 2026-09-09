@@ -450,3 +450,85 @@ test("unknown native thread states deny runtime restart until authoritative reco
     assert.equal(JSON.stringify(many).includes("future-"), false);
   } finally { await native.close(); }
 });
+
+async function releaseLateTurn(native: AppServerManager, status: unknown): Promise<void> {
+  await assert.rejects(native.request("turn/start", {
+    threadId: "late-status-thread", input: [{ type: "text", text: "late-turn-status-fixture" }],
+  }), /UNKNOWN/);
+  assert.equal(native.status().native_mutation_outcome_unknown, true);
+  // The fixture writes the late acknowledgement before this barrier response.
+  await native.request("test/release-late-turn", status === undefined ? {} : { status });
+}
+
+test("late turn/start futureState cannot clear UNKNOWN or permit runtime restart", async () => {
+  const native = manager();
+  const surface = new ControlSurface(native);
+  native.runtime.ensureThread("late-status-thread");
+  try {
+    await releaseLateTurn(native, "futureState");
+    const observed = object(await surface.call("codex_runtime", { action: "status" }));
+    assert.equal(observed.safe_to_restart, false);
+    assert.equal(observed.native_mutation_outcome_unknown, true);
+    assert.ok((observed.restart_denied_reasons as string[]).includes("native_mutation_outcome_unknown"));
+    const pid = observed.pid;
+    await assert.rejects(surface.call("codex_runtime", { action: "restart" }), /RESTART_DENIED/);
+    assert.equal(native.status().pid, pid);
+    const delta = object(await surface.call("codex_observe", { thread_id: "late-status-thread" }));
+    assert.equal(delta.effective_mode, "diagnostic");
+    assert.equal(object(delta.reanchor).required, true);
+    assert.equal((delta.events as Array<Record<string, unknown>>).some(event => event.method === "appServer/lateResponseReconciled"), false);
+
+    // Explicit recovery is justified by actual fake-child exit, not by reading
+    // an error or retaining a previously safe idle snapshot.
+    await assert.rejects(native.request("test/exit", {}), /exited unexpectedly/);
+    assert.equal(native.status().safe_to_restart, true);
+    assert.equal(object(await surface.call("codex_runtime", { action: "restart" })).restarted, true);
+    assert.notEqual(native.status().pid, pid);
+    assert.equal(object(await native.request("test/handshake", {})).initialized, true);
+  } finally { await native.close(); }
+});
+
+test("late turn/start malformed or unsupported status preserves UNKNOWN and earlier terminal evidence", async (t) => {
+  for (const status of [undefined, null, "", 17, {}, ["completed"], "unknown", "idle", "active", "appServerExited", "completed "]) {
+    await t.test(status === undefined ? "missing" : JSON.stringify(status), async () => {
+      const native = manager();
+      native.runtime.recordNotification("turn/completed", {
+        threadId: "late-status-thread", turn: { id: "earlier-turn", status: "completed", items: [] },
+      });
+      try {
+        await releaseLateTurn(native, status);
+        assert.equal(native.status().native_mutation_outcome_unknown, true);
+        assert.equal(native.status().safe_to_restart, false);
+        await assert.rejects(new ControlSurface(native).call("codex_runtime", { action: "restart" }), /RESTART_DENIED/);
+        const observation = native.runtime.observe("late-status-thread", 0, 100)!;
+        assert.equal(observation.terminal?.turn_id, "earlier-turn");
+        assert.equal(observation.active_turn_id, null);
+        assert.equal(observation.events.some(event => event.method === "appServer/lateResponseReconciled"), false);
+      } finally { await native.close(); }
+    });
+  }
+});
+
+test("recognized late turn/start statuses preserve active guards and known terminal restart safety", async (t) => {
+  for (const status of ["inProgress", "completed", "failed", "interrupted"]) {
+    await t.test(status, async () => {
+      const native = manager();
+      native.runtime.ensureThread("late-status-thread");
+      try {
+        assert.equal(native.status().safe_to_restart, true);
+        await releaseLateTurn(native, status);
+        assert.equal(native.status().native_mutation_outcome_unknown, false);
+        assert.equal(native.status().safe_to_restart, status !== "inProgress");
+        const observation = native.runtime.observe("late-status-thread", 0, 100)!;
+        assert.equal(observation.active_turn_id, status === "inProgress" ? "late-status-turn" : null);
+        if (status === "inProgress") {
+          await assert.rejects(new ControlSurface(native).call("codex_runtime", { action: "restart" }), /RESTART_DENIED.*active_turns/);
+        } else {
+          native.runtime.recordNotification("thread/status/changed", { threadId: "late-status-thread", status: "futureState" });
+          assert.equal(native.status().safe_to_restart, false);
+          assert.ok(native.status().restart_denied_reasons.includes("unknown_runtime_state"));
+        }
+      } finally { await native.close(); }
+    });
+  }
+});

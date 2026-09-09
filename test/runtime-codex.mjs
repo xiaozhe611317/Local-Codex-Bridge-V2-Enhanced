@@ -2,6 +2,7 @@ import readline from "node:readline";
 if (process.argv.slice(2).join(" ") !== "app-server --listen stdio://") process.exit(64);
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 let initialized = false;
+let lateTurn = null;
 function send(message) { process.stdout.write(JSON.stringify(message) + "\n"); }
 lines.on("line", line => {
   const message = JSON.parse(line);
@@ -13,6 +14,20 @@ lines.on("line", line => {
   else if (message.method === "test/exit") process.exit(23);
   else if (message.method === "test/malformed") process.stdout.write("malformed fixture JSONL" + String.fromCharCode(10));
   else if (message.method === "test/rpc-error") send({ id: message.id, error: { code: -32603, message: "synthetic native error" } });
+  else if (message.method === "turn/start" && message.params.input?.[0]?.text === "late-turn-status-fixture") {
+    lateTurn = message;
+  }
+  else if (message.method === "test/release-late-turn") {
+    if (!lateTurn) {
+      send({ id: message.id, error: { code: -32603, message: "No delayed fixture turn" } });
+    } else {
+      const turn = { id: "late-status-turn" };
+      if (Object.hasOwn(message.params, "status")) turn.status = message.params.status;
+      send({ id: lateTurn.id, result: { turn } });
+      lateTurn = null;
+      send({ id: message.id, result: { released: true } });
+    }
+  }
   else if (message.method === "turn/steer") {
     send({ method: "item/commandExecution/outputDelta", params: {
       threadId: message.params.threadId, turnId: message.params.expectedTurnId, itemId: "cmd", delta: "new fixture output",
@@ -31,6 +46,6 @@ lines.on("line", line => {
     send({ id: 0, method: "item/tool/requestUserInput", params: { threadId: "thread", questions: [] } });
     send({ id: message.id, result: {} });
   }
-  // turn/start intentionally receives no response to exercise UNKNOWN.
+  // Other turn/start requests intentionally receive no response to exercise UNKNOWN.
 });
 lines.on("close", () => process.exit(0));

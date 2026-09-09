@@ -762,14 +762,21 @@ export class AppServerManager {
     if (!turnId) {
       return false;
     }
-    const status = typeof turn?.status === "string" && turn.status.length > 0
-      ? turn.status
-      : undefined;
+    const status = turn?.status;
+    // A scoped turn id alone cannot settle a timed-out mutation. Validate the
+    // native Turn status before reconciliation can preserve an older idle state.
+    // Thread/Bridge states (for example idle) are not supported Turn statuses.
+    if (typeof status !== "string" || !["inProgress", "completed", "failed", "interrupted"].includes(status)) {
+      this.runtime.recordDiagnostic("mutation_outcome_unknown", {
+        method: candidate.method, reason: "invalid_late_turn_status",
+      }, candidate.requestedThreadId, turnId);
+      return false;
+    }
     this.runtime.reconcileLateMutationSuccess({
       method: candidate.method,
       threadId: candidate.requestedThreadId,
       turnId,
-      ...(status ? { status } : {}),
+      status,
       timedOutAt: retained.timedOutAt,
     });
     return true;

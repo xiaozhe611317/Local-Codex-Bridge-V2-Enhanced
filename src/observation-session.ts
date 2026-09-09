@@ -61,7 +61,8 @@ export class ObservationSession {
   acquire(threadId: string, generation: number): ObservationLease {
     if (this.#busy.has(threadId)) throw new Error("OBSERVE_IN_PROGRESS: automatic observation already active for this connection/thread");
     const previous = this.#states.get(threadId);
-    if (!previous && this.#states.size >= this.limit) {
+    const reserved = [...this.#busy].filter(id => !this.#states.has(id)).length;
+    if (!previous && this.#states.size + reserved >= this.limit) {
       const oldest = [...this.#states.keys()].find(id => !this.#busy.has(id));
       if (oldest === undefined) throw new Error("OBSERVE_CAPACITY: all bounded connection cursors are in use");
       this.#states.delete(oldest);
@@ -73,10 +74,10 @@ export class ObservationSession {
       : { ...fresh(generation),
           diagnosticCursor: previous?.diagnosticCursor ?? 0,
           connectionDiagnosticCursor: previous?.connectionDiagnosticCursor ?? 0 };
+    // Busy leases reserve capacity, but #states contains only delivered cursors.
+    // An evicted/missing cursor stays missing across rollback; installing a fresh
+    // zero cursor here would falsely erase connection_cursor_unavailable on retry.
     this.#busy.add(threadId);
-    this.#states.delete(threadId);
-    // Reserve the slot, but never consume evidence until delivery commits.
-    this.#states.set(threadId, previous ?? fresh(generation));
     const epoch = this.#epoch;
     let finished = false;
     const release = (): void => {
@@ -89,7 +90,10 @@ export class ObservationSession {
       generationChanged,
       cursorUnavailable: previous === undefined && this.#evicted,
       commit: next => {
-        if (!finished && epoch === this.#epoch) this.#states.set(threadId, next);
+        if (!finished && epoch === this.#epoch) {
+          this.#states.delete(threadId);
+          this.#states.set(threadId, next);
+        }
         release();
       },
       release,

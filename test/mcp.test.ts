@@ -685,3 +685,81 @@ test("MCP auto delivery is incremental, manual reads are independent, and protoc
     assert.equal(client.takeUnclaimed().some(message => message.id === 9), false);
   } finally { assert.equal(await client.close(), 0); }
 });
+
+test("MCP stdout delivery failure after cursor eviction retains reanchor on retry", async () => {
+  const runtime = new RuntimeStore();
+  const threadId = "evicted-thread";
+  runtime.recordNotification("item/started", { threadId, item: { id: "original-command" } });
+  const control = new ControlSurface({ runtime } as unknown as AppServerManager);
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const stdinDescriptor = Object.getOwnPropertyDescriptor(process, "stdin")!;
+  const stdoutDescriptor = Object.getOwnPropertyDescriptor(process, "stdout")!;
+  const messages: Record<string, unknown>[] = [];
+  let buffer = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    buffer += chunk;
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line) messages.push(JSON.parse(line) as Record<string, unknown>);
+    }
+  });
+  let failedDelivery: Record<string, unknown> | undefined;
+  const write = output.write.bind(output);
+  output.write = ((chunk: string, encoding: BufferEncoding, callback: (error?: Error | null) => void): boolean => {
+    const message = JSON.parse(String(chunk)) as Record<string, unknown>;
+    if (message.id === 300 && failedDelivery === undefined) {
+      failedDelivery = message;
+      callback(new Error("synthetic response write failure"));
+      return true;
+    }
+    return write(chunk, encoding, callback);
+  }) as typeof output.write;
+  const request = async (id: number, method: string, params: unknown = {}) => {
+    input.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    const deadline = Date.now() + 2000;
+    while (!messages.some(message => message.id === id)) {
+      if (Date.now() > deadline) throw new Error("MCP regression response timeout");
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    // Wait for the send callback and finally/rollback to complete.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    return messages.splice(messages.findIndex(message => message.id === id), 1)[0]!;
+  };
+  const observe = (id: number, thread: string) => request(id, "tools/call", {
+    name: "codex_observe", arguments: { thread_id: thread },
+  });
+  let server: McpStdioServer | undefined;
+  Object.defineProperty(process, "stdin", { configurable: true, value: input });
+  Object.defineProperty(process, "stdout", { configurable: true, value: output });
+  try {
+    server = new McpStdioServer(control, { onClose: () => undefined });
+    server.start();
+    await request(1, "initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "eviction-test", version: "1" } });
+    const original = successfulToolPayload(await observe(2, threadId));
+    assert.equal((original.events as unknown[]).length, 1);
+    // Exercise the real MCP connection's fixed 128-thread bound.
+    for (let index = 0; index < 128; index += 1) {
+      const other = "other-" + index;
+      runtime.ensureThread(other);
+      successfulToolPayload(await observe(10 + index, other));
+    }
+    const failure = await observe(300, threadId);
+    assert.equal((failure.result as Record<string, unknown>).isError, true);
+    assert.equal((successfulToolPayload(failedDelivery!).reanchor as Record<string, unknown>).required, true);
+    const retry = successfulToolPayload(await observe(301, threadId));
+    assert.equal((retry.reanchor as Record<string, unknown>).required, true);
+    assert.ok(((retry.reanchor as Record<string, unknown>).reasons as string[]).includes("connection_cursor_unavailable"));
+    assert.equal(retry.next_cursor, original.next_cursor);
+    assert.deepEqual(successfulToolPayload(await observe(302, threadId)).events, []);
+  } finally {
+    await server?.close();
+    Object.defineProperty(process, "stdin", stdinDescriptor);
+    Object.defineProperty(process, "stdout", stdoutDescriptor);
+    input.destroy();
+    output.destroy();
+  }
+});

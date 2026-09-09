@@ -103,8 +103,15 @@ export interface RuntimeSupervisionStatus {
   loaded_threads: number;
   active_turns: number;
   unscoped_active_threads: number;
+  unknown_state_threads: number;
   pending_requests: number;
   responding_requests: number;
+}
+
+const KNOWN_RUNTIME_STATES = new Set(["idle", "active", "inProgress", "notLoaded", "completed", "failed", "interrupted", "appServerExited"]);
+
+export function isKnownRuntimeStatus(status: string): boolean {
+  return KNOWN_RUNTIME_STATES.has(status);
 }
 
 export interface RuntimeObservation {
@@ -410,15 +417,18 @@ export class RuntimeStore {
   supervisionStatus(): RuntimeSupervisionStatus {
     let active = 0;
     let unscopedActive = 0;
+    let unknown = 0;
     for (const thread of this.#threads.values()) {
       if (thread.activeTurnId) active += 1;
       else if (["active", "inProgress"].includes(thread.status)) unscopedActive += 1;
+      if (!isKnownRuntimeStatus(thread.status)) unknown += 1;
     }
     return {
       generation: this.#generation,
       loaded_threads: this.#threads.size,
       active_turns: active,
       unscoped_active_threads: unscopedActive,
+      unknown_state_threads: unknown,
       pending_requests: this.#pending.size,
       responding_requests: this.#responding.size,
     };
@@ -684,7 +694,7 @@ export class RuntimeStore {
       runtime.status =
         typeof status === "string"
           ? status
-          : stringField(asRecord(status), "type") ?? runtime.status;
+          : stringField(asRecord(status), "type") ?? "unknown";
     }
 
     this.#appendEvent(runtime, method, params, turnId);

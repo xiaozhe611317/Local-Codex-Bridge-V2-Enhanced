@@ -416,3 +416,37 @@ test("malformed and wrongly scoped late acknowledgements cannot fabricate reconc
     } finally { await native.close(); }
   }
 });
+
+test("unknown native thread states deny runtime restart until authoritative recovery", async () => {
+  const native = manager();
+  const surface = new ControlSurface(native);
+  try {
+    assert.equal(native.status().state, "not_started");
+    assert.equal(native.status().safe_to_restart, true);
+    await native.ensureReady();
+    const pid = native.status().pid;
+    for (const status of ["futureState", "unknown", "UNKNOWN", "", { type: "futureState" }, {}, null, undefined]) {
+      native.runtime.recordNotification("thread/status/changed", { threadId: "thread", status });
+      const observed = object(await surface.call("codex_runtime", { action: "status" }));
+      assert.equal(observed.safe_to_restart, false, JSON.stringify(status));
+      assert.ok((observed.restart_denied_reasons as string[]).includes("unknown_runtime_state"));
+      assert.equal(object(observed.live).unknown_state_threads, 1);
+      await assert.rejects(surface.call("codex_runtime", { action: "restart" }), /RESTART_DENIED.*unknown_runtime_state/);
+      assert.equal(native.status().pid, pid);
+      native.runtime.recordNotification("thread/status/changed", { threadId: "thread", status: { type: "idle" } });
+      assert.equal(native.status().safe_to_restart, true);
+    }
+    for (const status of ["idle", "notLoaded", "completed", "failed", "interrupted"]) {
+      native.runtime.recordNotification("thread/status/changed", { threadId: "thread", status });
+      assert.equal(native.status().safe_to_restart, true, status);
+    }
+    for (let index = 0; index < 100; index += 1) {
+      native.runtime.recordNotification("thread/status/changed", { threadId: "unknown-" + index, status: "future-" + index });
+    }
+    const many = native.status();
+    assert.equal(many.safe_to_restart, false);
+    assert.equal(object(many.live).unknown_state_threads, 100);
+    assert.deepEqual(many.restart_denied_reasons, ["unknown_runtime_state"]);
+    assert.equal(JSON.stringify(many).includes("future-"), false);
+  } finally { await native.close(); }
+});

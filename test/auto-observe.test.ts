@@ -251,3 +251,48 @@ test("a contradictory old completion cannot clear the authoritative active turn 
   assert.equal(runtime.pendingForThread("thread").length, 1);
   await assert.rejects(manager.restart(), /RESTART_DENIED/);
 });
+
+test("ControlSurface eviction plus repeated delivery rollback preserves explicit cursor-loss reanchor", async () => {
+  const { runtime, control } = setup();
+  event(runtime, "item/started", { id: "a-command" }, "thread-a");
+  event(runtime, "item/started", { id: "b-command" }, "thread-b");
+  const session = new ObservationSession(1);
+  const delivered = obj(await control.call("codex_observe", { thread_id: "thread-a" }, undefined, { observationSession: session }));
+  await control.call("codex_observe", { thread_id: "thread-b" }, undefined, { observationSession: session });
+  let delivery!: ObservationDelivery;
+  const context = { observationSession: session, deferObservation: (value: ObservationDelivery) => { delivery = value; } };
+  for (const mode of ["auto", "supervision", "raw", "auto"]) {
+    const retry = obj(await control.call("codex_observe", { thread_id: "thread-a", mode }, undefined, context));
+    assert.equal(obj(retry.reanchor).required, true, mode);
+    assert.ok((obj(retry.reanchor).reasons as string[]).includes("connection_cursor_unavailable"), mode);
+    // With no retained consumption cursor, existing evidence is explicitly
+    // unanchored; it must never be presented as an ordinary unseen delta.
+    assert.equal(retry.next_cursor, delivered.next_cursor);
+    assert.equal(retry.current_cursor, delivered.current_cursor);
+    delivery.rollback();
+    delivery.commit(); // a stale/rolled-back delivery cannot commit later
+  }
+  const success = obj(await control.call("codex_observe", { thread_id: "thread-a" }, undefined, context));
+  assert.equal(obj(success.reanchor).required, true);
+  delivery.commit();
+  delivery.rollback();
+  const next = obj(await control.call("codex_observe", { thread_id: "thread-a" }, undefined, { observationSession: session }));
+  assert.deepEqual(next.events, []);
+  assert.equal(obj(next.reanchor).required, false);
+  assert.equal(next.next_cursor, delivered.next_cursor);
+});
+
+test("uncommitted ControlSurface leases reserve bounded session capacity without storing a cursor", async () => {
+  const { runtime, control } = setup();
+  runtime.ensureThread("thread-a");
+  runtime.ensureThread("thread-b");
+  const session = new ObservationSession(1);
+  let delivery!: ObservationDelivery;
+  await control.call("codex_observe", { thread_id: "thread-a" }, undefined, {
+    observationSession: session, deferObservation: value => { delivery = value; },
+  });
+  await assert.rejects(control.call("codex_observe", { thread_id: "thread-b" }, undefined, { observationSession: session }), /OBSERVE_CAPACITY/);
+  delivery.rollback();
+  const fresh = obj(await control.call("codex_observe", { thread_id: "thread-b" }, undefined, { observationSession: session }));
+  assert.equal(obj(fresh.reanchor).required, false);
+});

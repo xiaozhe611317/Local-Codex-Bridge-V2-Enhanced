@@ -1,5 +1,5 @@
 import type { AppServerStatus } from "./app-server.js";
-import { sanitizeForTransport, type RuntimeDiagnostic, type RuntimeEvent, type RuntimeObservation } from "./runtime.js";
+import { isKnownRuntimeStatus, sanitizeForTransport, type RuntimeDiagnostic, type RuntimeEvent, type RuntimeObservation } from "./runtime.js";
 import { AUTO_PENDING_LIMIT, fingerprint, type ConnectionDiagnostic, type ObservationState } from "./observation-session.js";
 import { deltaSummary, object, requestReference, short } from "./observation-summary.js";
 import { supervisionObservation } from "./supervision.js";
@@ -19,7 +19,6 @@ export interface AutomaticObservationInput {
   supportedRequests: ReadonlySet<string>;
   appServerStatus?: AppServerStatus;
 }
-const KNOWN_STATES = new Set(["idle", "active", "inProgress", "notLoaded", "completed", "failed", "interrupted", "appServerExited"]);
 const REANCHOR_CODES = new Set(["cursor_lost", "runtime_generation_changed", "connection_cursor_unavailable",
   "live_unreconstructable", "turn_terminal_conflict", "app_server_unavailable", "app_server_unexpected_exit", "restart_failure", "mutation_outcome_unknown", "pending_state_limit"]);
 
@@ -73,7 +72,7 @@ export function automaticObservation(input: AutomaticObservationInput): { result
   if (input.generationChanged || (previous.cursor === 0 && input.generation > 0)) add("runtime_generation_changed", "generation:" + input.generation);
   if (input.cursorUnavailable) add("connection_cursor_unavailable");
   if (snapshot?.cursor_lost) add("cursor_lost", "floor:" + snapshot.cursor_floor);
-  if (snapshot && !KNOWN_STATES.has(snapshot.runtime_status)) add("unknown_state", "state:" + snapshot.runtime_status);
+  if (snapshot && !isKnownRuntimeStatus(snapshot.runtime_status)) add("unknown_state", "state:" + snapshot.runtime_status);
   if (snapshot?.runtime_status === "appServerExited") add("app_server_unexpected_exit");
   if (snapshot?.terminal && (snapshot.active_turn_id !== null || ["active", "inProgress"].includes(snapshot.runtime_status))) {
     add("turn_terminal_conflict", "terminal:" + snapshot.terminal.turn_id, snapshot.terminal.turn_id);

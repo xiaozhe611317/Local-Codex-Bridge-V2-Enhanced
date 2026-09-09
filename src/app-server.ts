@@ -399,6 +399,7 @@ export class AppServerManager {
     if (state === "starting") reasons.push("initialization_in_progress");
     if (live.active_turns > 0) reasons.push("active_turns");
     if (live.unscoped_active_threads > 0) reasons.push("unscoped_active_threads");
+    if (live.unknown_state_threads > 0) reasons.push("unknown_runtime_state");
     if (live.pending_requests > 0) reasons.push("pending_requests");
     if (this.#operations > 0 || this.#pendingCalls.size > 0 || this.#writesInFlight > 0) reasons.push("native_operations_in_flight");
     if (this.#uncertainMutation && child && !exited) reasons.push("native_mutation_outcome_unknown");

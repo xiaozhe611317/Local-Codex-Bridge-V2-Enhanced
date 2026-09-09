@@ -70,3 +70,10 @@ Evidence: `test/enhancements.test.ts`, `test/targeting.test.ts`, `test/runtime-c
 Evidence: test/auto-observe.test.ts, test/auto-mcp-fixture.mjs and the independent MCP stdio test, plus real fake-child UNKNOWN/late-response/error/restart tests.
 
 A turn/completed notification for a different turn preserves the exact known active turn and its pending requests; Bridge records the contradictory scoped event and requires re-anchoring instead of declaring the active turn complete.
+
+## Audit blocker corrections
+
+- Restart also denies any unrecognized native runtime/thread status with the single bounded reason `unknown_runtime_state` and a count, without returning raw status values. Malformed status notifications become unknown instead of retaining a formerly safe idle status. Known subsequent native state evidence can settle that condition; existing active, pending and UNKNOWN mutation guards remain independent.
+- Automatic observation leases reserve bounded capacity separately from successfully delivered cursors. Eviction makes the cursor unavailable; rollback/cancellation/write failure cannot replace that absence with a fabricated initial cursor. Retained events returned during re-anchoring remain explicitly marked as unanchored, never silently presented as a known unseen delta. Only successful delivery commits the cursor and LRU position.
+
+Regression evidence: unknown-state runtime tool denial/recovery, ControlSurface eviction plus repeated deferred rollback, real MCP stdout failure after eviction, and reserved-capacity enforcement.

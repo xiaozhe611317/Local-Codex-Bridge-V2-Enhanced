@@ -315,6 +315,8 @@ node <repository>/dist/src/index.js
 
 ## 可选：Secure MCP Tunnel
 
+Windows 持久保存运行密钥、DPAPI CurrentUser 保护和登录自启动方法见 [Windows 安全自启动指南](WINDOWS-SECURE-AUTOSTART.md)。现有有效密钥可复用；DPAPI 保存不改变服务端有效期。
+
 远程 MCP 场景可以在 Bridge 前面使用 Secure MCP Tunnel：
 
 ```text

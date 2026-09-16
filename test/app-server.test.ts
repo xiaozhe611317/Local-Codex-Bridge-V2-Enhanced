@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { readFile, rm } from "node:fs/promises";
+import { readFile, rm, mkdtemp, mkdir, writeFile, copyFile, rename } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
   AppServerManager,
+  resolveCodexExecutable,
   createSerializedWriter,
   writeWithBackpressure,
 } from "../src/app-server.js";
@@ -14,6 +17,55 @@ import { ControlSurface, TOOL_DEFINITIONS } from "../src/tools.js";
 import { WINDOWS_PLATFORM_POLICY } from "../src/platform.js";
 
 const fakeCodex = fileURLToPath(new URL("../../test/fake-codex.mjs", import.meta.url));
+
+test("desktop update between manager creation and launches resolves the new executable", { skip: process.platform !== "win32" }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "bridge-live-update-"));
+  const bin = path.join(root, "OpenAI", "Codex", "bin");
+  const old = path.join(bin, "aabb", "codex.exe");
+  const current = path.join(bin, "ccdd", "codex.exe");
+  await mkdir(path.dirname(old), { recursive: true });
+  await mkdir(path.dirname(current), { recursive: true });
+  await writeFile(old, "obsolete executable");
+  const manager = new AppServerManager(undefined, {
+    environment: { ...process.env, LOCALAPPDATA: root, CODEX_EXE: old },
+    prefixArgs: [fakeCodex],
+  });
+  try {
+    await rm(old);
+    await copyFile(process.execPath, current);
+    await manager.ensureReady();
+    // Windows permits renaming the running image, as desktop updaters do.
+    await rename(current, path.join(path.dirname(current), "retired.exe"));
+    await copyFile(process.execPath, old);
+    await manager.restart();
+  } finally {
+    await manager.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("desktop executable discovery survives updates and preserves explicit custom paths", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "bridge-executable-"));
+  try {
+    const bin = path.join(root, "OpenAI", "Codex", "bin");
+    const current = path.join(bin, "aabbcc", "codex.exe");
+    const stale = path.join(bin, "112233", "codex.exe");
+    await mkdir(path.dirname(current), { recursive: true });
+    await mkdir(path.join(bin, "ddeeff"), { recursive: true });
+    await writeFile(current, "fixture");
+    assert.equal(resolveCodexExecutable({ LOCALAPPDATA: root, CODEX_EXE: stale }, "win32"), current);
+    assert.equal(resolveCodexExecutable({ LOCALAPPDATA: root }, "win32"), current);
+    assert.equal(resolveCodexExecutable({ LOCALAPPDATA: root, CODEX_EXE: current }, "win32"), current);
+    const custom = path.join(root, "custom", "codex.exe");
+    assert.equal(resolveCodexExecutable({ LOCALAPPDATA: root, CODEX_EXE: custom }, "win32"), custom);
+    assert.equal(resolveCodexExecutable({ LOCALAPPDATA: root }, "darwin"), "codex");
+    assert.throws(() => resolveCodexExecutable({ CODEX_EXE: "bad\npath" }), /control character/);
+    await rm(current);
+    assert.equal(resolveCodexExecutable({ LOCALAPPDATA: root, CODEX_EXE: stale }, "win32"), stale);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 const timeoutCodex = fileURLToPath(new URL("../../test/timeout-codex.mjs", import.meta.url));
 const pendingWriteCodex = fileURLToPath(new URL("../../test/pending-write-codex.mjs", import.meta.url));
 const lateResponseCodex = fileURLToPath(new URL("../../test/late-response-codex.mjs", import.meta.url));

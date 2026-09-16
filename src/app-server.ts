@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import path from "node:path";
 import type { Writable } from "node:stream";
 
 import {
@@ -178,14 +180,34 @@ function requestTimeoutError(method: string): Error {
 
 export function resolveCodexExecutable(
   environment: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): string {
   const explicit = environment.CODEX_EXE?.trim();
   if (explicit) {
     if (/[\0\r\n]/.test(explicit)) {
       throw new Error("CODEX_EXE contains an invalid control character");
     }
-    return explicit;
   }
+  // Desktop updates replace the versioned bin directory. Recover only paths
+  // belonging to this user's official desktop installation, never custom paths.
+  if (platform === "win32" && environment.LOCALAPPDATA) {
+    const bin = path.join(environment.LOCALAPPDATA, "OpenAI", "Codex", "bin");
+    const relative = explicit ? path.relative(bin, explicit) : "";
+    const desktopPath = /^[a-f0-9]+[\\/]codex\.exe$/i.test(relative);
+    if (!explicit || (desktopPath && !existsSync(explicit))) {
+      try {
+        const candidates = readdirSync(bin, { withFileTypes: true })
+          .filter(entry => entry.isDirectory() && /^[a-f0-9]+$/i.test(entry.name))
+          .map(entry => path.join(bin, entry.name, "codex.exe"))
+          .filter(candidate => existsSync(candidate) && statSync(candidate).isFile())
+          .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs || a.localeCompare(b));
+        if (candidates[0]) return candidates[0];
+      } catch {
+        // Preserve the original explicit-path/PATH error if discovery fails.
+      }
+    }
+  }
+  if (explicit) return explicit;
   return "codex";
 }
 
@@ -358,7 +380,7 @@ export function createSerializedWriter(
 export class AppServerManager {
   readonly runtime: RuntimeStore;
 
-  readonly #executable: string;
+  readonly #executable: string | undefined;
   readonly #prefixArgs: readonly string[];
   readonly #environment: NodeJS.ProcessEnv;
   readonly #platformPolicy: PlatformPolicy;
@@ -485,7 +507,7 @@ export class AppServerManager {
     this.runtime = runtime;
     const sourceEnvironment = options.environment ?? process.env;
     this.#platformPolicy = options.platformPolicy ?? platformPolicyFor();
-    this.#executable = options.executable ?? resolveCodexExecutable(sourceEnvironment);
+    this.#executable = options.executable;
     this.#prefixArgs = options.prefixArgs ?? [];
     this.#environment = resolveCodexChildEnvironment(sourceEnvironment);
     this.#requestTimeoutMs =
@@ -557,10 +579,14 @@ export class AppServerManager {
   }
 
   async #start(): Promise<void> {
+    // Desktop updates can remove a version directory while this manager lives.
+    // Resolve on every launch, including an explicitly requested restart.
+    // Caller-supplied executable overrides remain authoritative.
+    const executable = this.#executable ?? resolveCodexExecutable(this.#environment);
     let child: ChildProcessWithoutNullStreams;
     try {
       child = spawn(
-        this.#executable,
+        executable,
         [...this.#prefixArgs, "app-server", "--listen", "stdio://"],
         {
           stdio: ["pipe", "pipe", "pipe"],
@@ -570,7 +596,7 @@ export class AppServerManager {
       );
     } catch (error) {
       this.#fatal = new Error(
-        `Failed to spawn ${this.#executable}: ${redactText(messageFromUnknown(error))}`,
+        `Failed to spawn ${executable}: ${redactText(messageFromUnknown(error))}`,
       );
       throw this.#fatal;
     }
